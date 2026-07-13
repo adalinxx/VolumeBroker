@@ -1,12 +1,19 @@
 import Foundation
 import Testing
 import cashew
+import CID
+import Multihash
 @testable import VolumeBroker
 
 @Suite("BrokerFetcher")
 struct BrokerFetcherTests {
     typealias TestDictionary = VolumeMerkleDictionaryImpl<String>
     typealias TestVolume = VolumeImpl<TestDictionary>
+
+    private func cid(for data: Data) -> String {
+        let multihash = try! Multihash(raw: data, hashedWith: .sha2_256)
+        return try! CID(version: .v1, codec: .dag_cbor, multihash: multihash).toBaseEncodedString
+    }
 
     @Test func resolvesMultiNodeVolumeThroughBatchedSource() async throws {
         let broker = MemoryBroker()
@@ -47,27 +54,31 @@ struct BrokerFetcherTests {
     }
 
     @Test func fetchesInternalEntryByCidWithoutEnteringVolume() async throws {
-        // Object-grain storage: one volume "obj" holds multiple entries; the
+        // Object-grain storage: one Volume holds multiple entries; the
         // internal entry is NOT its own volume root. With the cas_data CID-blob
         // primitive it resolves directly by CID — no enterVolume needed.
         let broker = MemoryBroker()
         let storer = BrokerStorer(broker: broker)
-        try storer.enterVolume(rootCID: "obj")
-        try storer.store(rawCid: "obj", data: Data("root".utf8))
-        try storer.store(rawCid: "internal", data: Data("internal-data".utf8))
-        try storer.exitVolume(rootCID: "obj")
-        try await storer.flush(root: "obj")
+        let rootData = Data("root".utf8)
+        let internalData = Data("internal-data".utf8)
+        let root = cid(for: rootData)
+        let internalCID = cid(for: internalData)
+        try storer.enterVolume(rootCID: root)
+        try storer.store(rawCid: root, data: rootData)
+        try storer.store(rawCid: internalCID, data: internalData)
+        try storer.exitVolume(rootCID: root)
+        try await storer.flush(root: root)
 
-        // No volume is keyed "internal" — it's only an entry under "obj".
-        #expect(await broker.fetchVolumeLocal(root: "internal") == nil)
+        // No Volume is keyed by the internal CID; it is only an entry under root.
+        #expect(await broker.fetchVolumeLocal(root: internalCID) == nil)
 
         let source = BrokerFetcher(broker: broker)
-        let data = try await source.fetch(rawCid: "internal")
-        #expect(data == Data("internal-data".utf8))
+        let data = try await source.fetch(rawCid: internalCID)
+        #expect(data == internalData)
 
-        let batched = await source.fetch(["obj", "internal", "missing"])
-        #expect(batched["obj"] == Data("root".utf8))
-        #expect(batched["internal"] == Data("internal-data".utf8))
+        let batched = await source.fetch([root, internalCID, "missing"])
+        #expect(batched[root] == rootData)
+        #expect(batched[internalCID] == internalData)
         #expect(batched["missing"] == nil)
     }
 }

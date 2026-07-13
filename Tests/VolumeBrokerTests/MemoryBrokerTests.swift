@@ -1,14 +1,28 @@
 import Testing
 import Foundation
+import CID
+import Multihash
 @testable import VolumeBroker
 
 @Suite("MemoryBroker")
 struct MemoryBrokerTests {
 
+    private func cid(for data: Data) -> String {
+        let multihash = try! Multihash(raw: data, hashedWith: .sha2_256)
+        return try! CID(version: .v1, codec: .dag_cbor, multihash: multihash).toBaseEncodedString
+    }
+
+    private func cid(_ value: String) -> String {
+        cid(for: Data(value.utf8))
+    }
+
     private func payload(_ root: String, _ entries: [String: Data] = [:]) -> SerializedVolume {
-        var e = entries
-        if e.isEmpty { e = [root: Data(root.utf8)] }
-        return SerializedVolume(root: root, entries: e)
+        let rootData = Data(root.utf8)
+        var encodedEntries = [cid(for: rootData): rootData]
+        for data in entries.values {
+            encodedEntries[cid(for: data)] = data
+        }
+        return SerializedVolume(root: cid(for: rootData), entries: encodedEntries)
     }
 
     @Test func byteBudgetEvictionRespectsReadRecency() async throws {
@@ -20,12 +34,12 @@ struct MemoryBrokerTests {
         try await broker.storeVolumeLocal(payload("B", ["B": oneKiB]))
         // Refresh A's recency via a read. Without recency-on-read this is a no-op
         // and eviction is insertion-order (A oldest), so the hot volume A is lost.
-        _ = await broker.fetchVolumeLocal(root: "A")
+        _ = await broker.fetchVolumeLocal(root: cid("A"))
         // Storing C pushes over budget → the coldest UNPINNED volume is evicted.
         try await broker.storeVolumeLocal(payload("C", ["C": oneKiB]))
-        #expect(await broker.fetchVolumeLocal(root: "A") != nil)  // recently read → survives
-        #expect(await broker.fetchVolumeLocal(root: "B") == nil)  // coldest → evicted
-        #expect(await broker.fetchVolumeLocal(root: "C") != nil)  // newest → present
+        #expect(await broker.fetchVolumeLocal(root: cid("A")) != nil)  // recently read → survives
+        #expect(await broker.fetchVolumeLocal(root: cid("B")) == nil)  // coldest → evicted
+        #expect(await broker.fetchVolumeLocal(root: cid("C")) != nil)  // newest → present
         #expect(await broker.residentBytes() <= budget)
     }
 
@@ -34,10 +48,10 @@ struct MemoryBrokerTests {
         let p = payload("r1", ["c1": Data([1]), "c2": Data([2])])
         try await broker.storeVolumeLocal(p)
 
-        #expect(await broker.hasVolume(root: "r1"))
-        let fetched = await broker.fetchVolumeLocal(root: "r1")
-        #expect(fetched?.entries.count == 2)
-        #expect(fetched?.entries["c1"] == Data([1]))
+        #expect(await broker.hasVolume(root: p.root))
+        let fetched = await broker.fetchVolumeLocal(root: p.root)
+        #expect(fetched?.entries.count == 3)
+        #expect(fetched?.entries[cid(for: Data([1]))] == Data([1]))
     }
 
     @Test func missingVolumeReturnsNil() async {
@@ -61,19 +75,20 @@ struct MemoryBrokerTests {
 
     @Test func refCountedPins() async throws {
         let broker = MemoryBroker()
+        let root = cid("r1")
         try await broker.storeVolumeLocal(payload("r1"))
-        try await broker.pin(root: "r1", owner: "chain-a")
-        try await broker.pin(root: "r1", owner: "chain-a")
+        try await broker.pin(root: root, owner: "chain-a")
+        try await broker.pin(root: root, owner: "chain-a")
 
-        try await broker.unpin(root: "r1", owner: "chain-a")
-        #expect(await broker.owners(root: "r1") == ["chain-a"], "one unpin should leave count=1")
+        try await broker.unpin(root: root, owner: "chain-a")
+        #expect(await broker.owners(root: root) == ["chain-a"], "one unpin should leave count=1")
 
         let evicted = try await broker.evictUnpinned()
         #expect(evicted == 0)
-        #expect(await broker.hasVolume(root: "r1"))
+        #expect(await broker.hasVolume(root: root))
 
-        try await broker.unpin(root: "r1", owner: "chain-a")
-        #expect(await broker.owners(root: "r1").isEmpty)
+        try await broker.unpin(root: root, owner: "chain-a")
+        #expect(await broker.owners(root: root).isEmpty)
     }
 
     @Test func pinWithExplicitCount() async throws {
@@ -104,148 +119,154 @@ struct MemoryBrokerTests {
 
     @Test func evictUnpinnedRemovesOnlyUnpinned() async throws {
         let broker = MemoryBroker(evictUnpinnedGrace: .zero)
+        let keep = cid("r1")
+        let drop = cid("r2")
         try await broker.storeVolumeLocal(payload("r1"))
         try await broker.storeVolumeLocal(payload("r2"))
-        try await broker.pin(root: "r1", owner: "chain-a")
+        try await broker.pin(root: keep, owner: "chain-a")
 
         let evicted = try await broker.evictUnpinned()
         #expect(evicted == 1)
-        #expect(await broker.hasVolume(root: "r1"))
-        #expect(await broker.hasVolume(root: "r2") == false)
+        #expect(await broker.hasVolume(root: keep))
+        #expect(await broker.hasVolume(root: drop) == false)
     }
 
     @Test func retainedRootProtectsWithoutPinOwner() async throws {
         let broker = MemoryBroker(evictUnpinnedGrace: .zero)
+        let keep = cid("keep")
+        let drop = cid("drop")
         try await broker.storeVolumeLocal(payload("keep"))
         try await broker.storeVolumeLocal(payload("drop"))
 
-        try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: ["keep"], operationID: "op-1")
+        try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [keep], operationID: "op-1")
 
-        #expect(await broker.owners(root: "keep").isEmpty)
-        #expect(await broker.retainedRoots(scope: "chain-a:state") == ["keep"])
+        #expect(await broker.owners(root: keep).isEmpty)
+        #expect(await broker.retainedRoots(scope: "chain-a:state") == [keep])
         let evicted = try await broker.evictUnpinned()
         #expect(evicted == 1)
-        #expect(await broker.hasVolume(root: "keep"))
-        #expect(await broker.hasVolume(root: "drop") == false)
+        #expect(await broker.hasVolume(root: keep))
+        #expect(await broker.hasVolume(root: drop) == false)
     }
 
     @Test func retainedRootOperationIDIsPayloadBound() async throws {
         let broker = MemoryBroker(evictUnpinnedGrace: .zero)
+        let r1 = cid("r1")
+        let r2 = cid("r2")
         try await broker.storeVolumeLocal(payload("r1"))
         try await broker.storeVolumeLocal(payload("r2"))
 
-        try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: ["r1"], operationID: "op-1")
-        try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: ["r1"], operationID: "op-1")
+        try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [r1], operationID: "op-1")
+        try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [r1], operationID: "op-1")
 
         do {
-            try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: ["r2"], operationID: "op-1")
+            try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [r2], operationID: "op-1")
             #expect(Bool(false), "operation id replay with a different payload must fail")
         } catch BrokerError.conflictingRetainedRootOperation(let operationID) {
             #expect(operationID == "op-1")
         }
-        #expect(await broker.retainedRoots(scope: "chain-a:state") == ["r1"])
+        #expect(await broker.retainedRoots(scope: "chain-a:state") == [r1])
     }
 
     @Test func retainedRootMergeAddsWithoutReplacingScope() async throws {
         let broker = MemoryBroker(evictUnpinnedGrace: .zero)
+        let old = cid("old")
+        let new = cid("new")
+        let drop = cid("drop")
         try await broker.storeVolumeLocal(payload("old"))
         try await broker.storeVolumeLocal(payload("new"))
         try await broker.storeVolumeLocal(payload("drop"))
 
-        try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: ["old"], operationID: "op-1")
-        try await broker.mergeRetainedRoots(scope: "chain-a:state", roots: ["new"], operationID: "op-2")
-        try await broker.mergeRetainedRoots(scope: "chain-a:state", roots: ["new"], operationID: "op-2")
+        try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [old], operationID: "op-1")
+        try await broker.mergeRetainedRoots(scope: "chain-a:state", roots: [new], operationID: "op-2")
+        try await broker.mergeRetainedRoots(scope: "chain-a:state", roots: [new], operationID: "op-2")
 
-        #expect(await broker.retainedRoots(scope: "chain-a:state") == ["new", "old"])
+        #expect(Set(await broker.retainedRoots(scope: "chain-a:state")) == [new, old])
         let evicted = try await broker.evictUnpinned()
         #expect(evicted == 1)
-        #expect(await broker.hasVolume(root: "old"))
-        #expect(await broker.hasVolume(root: "new"))
-        #expect(await broker.hasVolume(root: "drop") == false)
+        #expect(await broker.hasVolume(root: old))
+        #expect(await broker.hasVolume(root: new))
+        #expect(await broker.hasVolume(root: drop) == false)
     }
 
     @Test func retainedRootMergeOperationIDIsPayloadAndKindBound() async throws {
         let broker = MemoryBroker(evictUnpinnedGrace: .zero)
+        let r1 = cid("r1")
+        let r2 = cid("r2")
         try await broker.storeVolumeLocal(payload("r1"))
         try await broker.storeVolumeLocal(payload("r2"))
 
-        try await broker.mergeRetainedRoots(scope: "chain-a:state", roots: ["r1"], operationID: "op-1")
+        try await broker.mergeRetainedRoots(scope: "chain-a:state", roots: [r1], operationID: "op-1")
 
         do {
-            try await broker.mergeRetainedRoots(scope: "chain-a:state", roots: ["r2"], operationID: "op-1")
+            try await broker.mergeRetainedRoots(scope: "chain-a:state", roots: [r2], operationID: "op-1")
             #expect(Bool(false), "operation id replay with a different payload must fail")
         } catch BrokerError.conflictingRetainedRootOperation(let operationID) {
             #expect(operationID == "op-1")
         }
 
         do {
-            try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: ["r1"], operationID: "op-1")
+            try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [r1], operationID: "op-1")
             #expect(Bool(false), "operation id replay with a different operation kind must fail")
         } catch BrokerError.conflictingRetainedRootOperation(let operationID) {
             #expect(operationID == "op-1")
         }
 
-        #expect(await broker.retainedRoots(scope: "chain-a:state") == ["r1"])
+        #expect(await broker.retainedRoots(scope: "chain-a:state") == [r1])
     }
 
-    @Test func retainedRootRejectsIncompleteStoredClosure() async throws {
+    @Test func retainedRootDoesNotRequireRelatedVolume() async throws {
         let broker = MemoryBroker(evictUnpinnedGrace: .zero)
-        try await broker.storeVolumesLocal([
-            SerializedVolume(root: "root", entries: [
-                "root": Data("root".utf8),
-                "child": Data("child".utf8),
-            ]),
-            SerializedVolume(root: "child", entries: [:]),
-        ])
+        let root = cid("root")
+        try await broker.storeVolumeLocal(payload("root"))
 
-        do {
-            try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: ["root"], operationID: "op-1")
-            #expect(Bool(false), "retaining a root with an incomplete stored closure must fail")
-        } catch BrokerError.missingRetainedRoot(let root) {
-            #expect(root == "child")
-        }
-        #expect(await broker.retainedRoots(scope: "chain-a:state").isEmpty)
+        try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [root], operationID: "op-1")
+
+        #expect(await broker.retainedRoots(scope: "chain-a:state") == [root])
     }
 
     @Test func evictUnpinnedRespectsStoreThenPinGrace() async throws {
         let broker = MemoryBroker(evictUnpinnedGrace: .seconds(600))
+        let root = cid("fresh")
         try await broker.storeVolumeLocal(payload("fresh"))
 
         let evicted = try await broker.evictUnpinned()
         #expect(evicted == 0)
-        #expect(await broker.hasVolume(root: "fresh"))
+        #expect(await broker.hasVolume(root: root))
     }
 
     @Test func ttlExpiredOwnerAutoRemoved() async throws {
         let broker = MemoryBroker(evictUnpinnedGrace: .zero)
+        let root = cid("r1")
         try await broker.storeVolumeLocal(payload("r1"))
-        try await broker.pin(root: "r1", owner: "chain-a:42", ttl: .zero)
+        try await broker.pin(root: root, owner: "chain-a:42", ttl: .zero)
 
-        #expect(await broker.owners(root: "r1").isEmpty)
+        #expect(await broker.owners(root: root).isEmpty)
         let evicted = try await broker.evictUnpinned()
         #expect(evicted == 1)
     }
 
     @Test func ttlExpiredButOtherOwnerKeepsAlive() async throws {
         let broker = MemoryBroker()
+        let root = cid("r1")
         try await broker.storeVolumeLocal(payload("r1"))
-        try await broker.pin(root: "r1", owner: "chain-a:42", ttl: .zero)
-        try await broker.pin(root: "r1", owner: "chain-b:tip")
+        try await broker.pin(root: root, owner: "chain-a:42", ttl: .zero)
+        try await broker.pin(root: root, owner: "chain-b:tip")
 
-        #expect(await broker.owners(root: "r1") == ["chain-b:tip"])
+        #expect(await broker.owners(root: root) == ["chain-b:tip"])
         let evicted = try await broker.evictUnpinned()
         #expect(evicted == 0)
-        #expect(await broker.hasVolume(root: "r1"))
+        #expect(await broker.hasVolume(root: root))
     }
 
     @Test func noTTLMeansIndefinite() async throws {
         let broker = MemoryBroker()
+        let root = cid("r1")
         try await broker.storeVolumeLocal(payload("r1"))
-        try await broker.pin(root: "r1", owner: "chain-a:tip")
+        try await broker.pin(root: root, owner: "chain-a:tip")
 
         let evicted = try await broker.evictUnpinned()
         #expect(evicted == 0)
-        #expect(await broker.hasVolume(root: "r1"))
+        #expect(await broker.hasVolume(root: root))
     }
 
     @Test func pinnedRootsByOwnerAndPrefix() async throws {
@@ -267,33 +288,38 @@ struct MemoryBrokerTests {
 
     @Test func capacityEvictsLRUUnpinned() async throws {
         let broker = MemoryBroker(capacity: 2)
+        let r1 = cid("r1")
+        let r2 = cid("r2")
+        let r3 = cid("r3")
         try await broker.storeVolumeLocal(payload("r1"))
         try await broker.storeVolumeLocal(payload("r2"))
         try await broker.storeVolumeLocal(payload("r3"))
 
-        #expect(await broker.hasVolume(root: "r1") == false)
-        #expect(await broker.hasVolume(root: "r2"))
-        #expect(await broker.hasVolume(root: "r3"))
+        #expect(await broker.hasVolume(root: r1) == false)
+        #expect(await broker.hasVolume(root: r2))
+        #expect(await broker.hasVolume(root: r3))
     }
 
     @Test func pinnedSurvivesCapacityEviction() async throws {
         let broker = MemoryBroker(capacity: 2)
+        let r1 = cid("r1")
         try await broker.storeVolumeLocal(payload("r1"))
-        try await broker.pin(root: "r1", owner: "chain-a")
+        try await broker.pin(root: r1, owner: "chain-a")
         try await broker.storeVolumeLocal(payload("r2"))
         try await broker.storeVolumeLocal(payload("r3"))
 
-        #expect(await broker.hasVolume(root: "r1"))
+        #expect(await broker.hasVolume(root: r1))
     }
 
     @Test func cascadeFetchFallsThrough() async throws {
         let local = MemoryBroker()
         let remote = MemoryBroker()
-        try await remote.storeVolumeLocal(payload("r1", ["c1": Data([42])]))
+        let p = payload("r1", ["c1": Data([42])])
+        try await remote.storeVolumeLocal(p)
 
         await local.link(near: remote)
-        let fetched = await local.fetchVolume(root: "r1")
-        #expect(fetched?.entries["c1"] == Data([42]))
+        let fetched = await local.fetchVolume(root: p.root)
+        #expect(fetched?.entries[cid(for: Data([42]))] == Data([42]))
     }
 }
 

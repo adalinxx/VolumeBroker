@@ -150,30 +150,25 @@ struct PinIndex {
         }
     }
 
-    /// True iff `cid` is covered by a live pin or retained root — the cid is a
-    /// root itself, or reachable UPWARD through `volume_entries` from a retained
-    /// object closure. This mirrors the eviction engine's downward protected set.
-    /// The upward walk follows "which volumes contain this cid", a short path
-    /// for merkle closures; UNION dedups the root-contains-itself self-edge.
+    /// True iff `cid` is a live Volume root or a direct entry of one. Related
+    /// Volume roots are independent and must be pinned or retained separately.
     func isPinReachable(cid: String) async -> Bool {
         await connection.read {
             let now = isoNow()
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
             let sql = """
-                WITH RECURSIVE up(c) AS (
-                    SELECT ?1
-                    UNION
-                    SELECT ve.root FROM volume_entries ve INNER JOIN up ON ve.cid = up.c
-                ),
-                live_roots(root) AS (
+                WITH live_roots(root) AS (
                     SELECT root FROM volume_pins
                     WHERE count > 0 AND (expires_at IS NULL OR expires_at > ?2)
                     UNION
                     SELECT root FROM retained_roots
                 )
-                SELECT 1 FROM live_roots lr
-                INNER JOIN up ON lr.root = up.c
+                SELECT 1 FROM live_roots WHERE root = ?1
+                UNION
+                SELECT 1 FROM volume_entries ve
+                INNER JOIN live_roots lr ON ve.root = lr.root
+                WHERE ve.cid = ?1
                 LIMIT 1
                 """
             guard sqlite3_prepare_v2(connection.readDb, sql, -1, &stmt, nil) == SQLITE_OK else { return false }

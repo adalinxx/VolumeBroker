@@ -1,5 +1,7 @@
 import Testing
 import Foundation
+import CID
+import Multihash
 @testable import VolumeBroker
 
 /// Independent unit tests for the `NegativeCache` collaborator and its
@@ -10,6 +12,18 @@ import Foundation
 /// "confirmed absent" verdict so a freshly-arrived volume is never masked.
 @Suite("NegativeCache")
 struct NegativeCacheTests {
+
+    private func cid(for data: Data) -> String {
+        let multihash = try! Multihash(raw: data, hashedWith: .sha2_256)
+        return try! CID(version: .v1, codec: .dag_cbor, multihash: multihash).toBaseEncodedString
+    }
+
+    private func volume(_ label: String, extraData: Data? = nil) -> SerializedVolume {
+        let rootData = Data(label.utf8)
+        var entries = [cid(for: rootData): rootData]
+        if let extraData { entries[cid(for: extraData)] = extraData }
+        return SerializedVolume(root: cid(for: rootData), entries: entries)
+    }
 
     private func tempStore() throws -> (CASVolumeStore, NegativeCache) {
         let path = NSTemporaryDirectory() + "vb_negcache_\(UUID().uuidString).sqlite"
@@ -90,32 +104,34 @@ struct NegativeCacheTests {
     /// fast-path must not mask the now-present volume.
     @Test func storeAfterMissIsVisible() async throws {
         let (store, cache) = try tempStore()
+        let payload = volume("r1", extraData: Data([1, 2, 3]))
 
         // Confirmed miss primes the negative cache.
-        #expect(await store.hasVolume(root: "r1") == false)
-        #expect(cache.mightBeAbsent("r1"))
+        #expect(await store.hasVolume(root: payload.root) == false)
+        #expect(cache.mightBeAbsent(payload.root))
 
         // Content later appears.
-        try await store.storeVolumeLocal(SerializedVolume(root: "r1", entries: ["c1": Data([1, 2, 3])]))
+        try await store.storeVolumeLocal(payload)
 
         // The negative-cache verdict must be invalidated...
-        #expect(cache.mightBeAbsent("r1") == false)
+        #expect(cache.mightBeAbsent(payload.root) == false)
         // ...and the volume must be visible despite the earlier miss.
-        #expect(await store.hasVolume(root: "r1"))
-        #expect(await store.fetchVolumeLocal(root: "r1")?.entries["c1"] == Data([1, 2, 3]))
+        #expect(await store.hasVolume(root: payload.root))
+        #expect(await store.fetchVolumeLocal(root: payload.root)?.entries[cid(for: Data([1, 2, 3]))] == Data([1, 2, 3]))
     }
 
     /// End-to-end regression: a stored root must not become a
     /// permanent false negative after many later stores.
     @Test func storeAfterMiss_survivesManyStores() async throws {
         let (store, _) = try tempStore()
-        #expect(await store.hasVolume(root: "r1") == false)
+        let payload = volume("r1", extraData: Data([1]))
+        #expect(await store.hasVolume(root: payload.root) == false)
 
-        try await store.storeVolumeLocal(SerializedVolume(root: "r1", entries: ["c1": Data([1])]))
+        try await store.storeVolumeLocal(payload)
         for i in 0..<1_000 {
-            try await store.storeVolumeLocal(SerializedVolume(root: "filler-\(i)", entries: ["c\(i)": Data([UInt8(i & 0xff)])]))
+            try await store.storeVolumeLocal(volume("filler-\(i)", extraData: Data([UInt8(i & 0xff)])))
         }
 
-        #expect(await store.hasVolume(root: "r1"))
+        #expect(await store.hasVolume(root: payload.root))
     }
 }

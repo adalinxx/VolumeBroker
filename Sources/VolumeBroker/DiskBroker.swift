@@ -91,8 +91,7 @@ public final class DiskBroker: @unchecked Sendable, VolumeBroker, RetainedRootBr
         await pins.owners(root: root)
     }
 
-    /// True iff `cid` is pinned or reachable upward from a pinned root through
-    /// `volume_entries` — i.e. covered by some pinned object closure.
+    /// True iff `cid` is a pinned Volume root or a direct entry of one.
     public func isPinReachable(cid: String) async -> Bool {
         await pins.isPinReachable(cid: cid)
     }

@@ -5,24 +5,21 @@ public final class BrokerStorer: VolumeAwareStorer, @unchecked Sendable {
     private struct Scope {
         let root: String
         var buffer: [String: Data]
-        var nestedVolumeRoots: Set<String>
     }
 
     private struct PendingVolume {
         let root: String
         let entries: [String: Data]
-        let nestedVolumeRoots: Set<String>
     }
 
     private let broker: any VolumeBroker
     // Stack of Volume scopes pushed by enterVolume. Each scope accumulates the
-    // ordinary bytes and explicit nested-boundary edges for one complete Volume.
+    // bytes for one complete, independent Volume.
     private var scopeStack: [Scope] = []
     // Volumes completed via exitVolume, waiting for async flush.
     private var pendingVolumes: [PendingVolume] = []
     // Fallback state for callers that use store() without entering a Volume.
     private var flatBuffer: [String: Data] = [:]
-    private var flatNestedVolumeRoots = Set<String>()
 
     public private(set) var storedRoots: [String] = []
 
@@ -41,24 +38,21 @@ public final class BrokerStorer: VolumeAwareStorer, @unchecked Sendable {
         for pending in pendingVolumes {
             volumes.append(SerializedVolume(
                 root: pending.root,
-                entries: pending.entries,
-                nestedVolumeRoots: pending.nestedVolumeRoots
+                entries: pending.entries
             ))
             storedRoots.append(pending.root)
         }
 
-        if !flatBuffer.isEmpty || !flatNestedVolumeRoots.isEmpty {
+        if !flatBuffer.isEmpty {
             volumes.append(SerializedVolume(
                 root: root,
-                entries: flatBuffer,
-                nestedVolumeRoots: flatNestedVolumeRoots
+                entries: flatBuffer
             ))
             storedRoots.append(root)
         }
 
         pendingVolumes = []
         flatBuffer = [:]
-        flatNestedVolumeRoots = []
         return volumes
     }
 
@@ -78,17 +72,8 @@ public final class BrokerStorer: VolumeAwareStorer, @unchecked Sendable {
     public func enterVolume(rootCID: String) throws {
         scopeStack.append(Scope(
             root: rootCID,
-            buffer: [:],
-            nestedVolumeRoots: []
+            buffer: [:]
         ))
-    }
-
-    public func includeNestedVolume(rootCID: String) throws {
-        if scopeStack.isEmpty {
-            flatNestedVolumeRoots.insert(rootCID)
-        } else {
-            scopeStack[scopeStack.count - 1].nestedVolumeRoots.insert(rootCID)
-        }
     }
 
     public func exitVolume(rootCID: String) throws {
@@ -96,12 +81,14 @@ public final class BrokerStorer: VolumeAwareStorer, @unchecked Sendable {
         guard expected == rootCID else {
             throw BrokerError.unbalancedVolumeScope(expected: expected, actual: rootCID)
         }
+        guard scopeStack[scopeStack.count - 1].buffer[rootCID] != nil else {
+            throw SerializedVolumeError.missingRootEntry(rootCID)
+        }
 
         let scope = scopeStack.removeLast()
         pendingVolumes.append(PendingVolume(
             root: scope.root,
-            entries: scope.buffer,
-            nestedVolumeRoots: scope.nestedVolumeRoots
+            entries: scope.buffer
         ))
     }
 
@@ -134,9 +121,18 @@ public final class BrokerStorer: VolumeAwareStorer, @unchecked Sendable {
         guard scopeStack.isEmpty else {
             throw BrokerError.incompleteVolumeScopes(scopeStack.map(\.root))
         }
-        let allVolumes = try collectCompleteVolumes(root: root)
-        if !allVolumes.isEmpty {
-            try await broker.storeVolumesLocal(allVolumes)
+
+        var allVolumes = pendingVolumes.map {
+            SerializedVolume(root: $0.root, entries: $0.entries)
         }
+        if !flatBuffer.isEmpty {
+            allVolumes.append(SerializedVolume(root: root, entries: flatBuffer))
+        }
+        guard !allVolumes.isEmpty else { return }
+
+        try await broker.storeVolumesLocal(allVolumes)
+        storedRoots.append(contentsOf: allVolumes.map(\.root))
+        pendingVolumes = []
+        flatBuffer = [:]
     }
 }

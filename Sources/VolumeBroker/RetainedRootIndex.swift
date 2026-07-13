@@ -31,7 +31,7 @@ struct RetainedRootIndex {
                 }
 
                 for root in canonicalRoots {
-                    try validateStoredVolumeClosure(root: root)
+                    try validateStoredVolume(root: root)
                 }
 
                 try connection.execBind("DELETE FROM retained_roots WHERE scope=?1") { stmt in
@@ -75,7 +75,7 @@ struct RetainedRootIndex {
                 }
 
                 for root in canonicalRoots {
-                    try validateStoredVolumeClosure(root: root)
+                    try validateStoredVolume(root: root)
                     try connection.execBind("INSERT OR IGNORE INTO retained_roots(scope, root) VALUES(?1, ?2)") { stmt in
                         sqlite3_bind_text(stmt, 1, scope, -1, SQLITE_TRANSIENT_SHIM)
                         sqlite3_bind_text(stmt, 2, root, -1, SQLITE_TRANSIENT_SHIM)
@@ -138,32 +138,24 @@ struct RetainedRootIndex {
         return (scope, roots)
     }
 
-    private func validateStoredVolumeClosure(root: String) throws {
+    private func validateStoredVolume(root: String) throws {
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
         let sql = """
-            WITH RECURSIVE closure(root) AS (
-                SELECT ?1
-                UNION
-                SELECT ve.cid
+            SELECT ?1
+            WHERE NOT EXISTS (
+                SELECT 1 FROM volume_metadata WHERE root = ?1
+            ) OR NOT EXISTS (
+                SELECT 1
                 FROM volume_entries ve
-                JOIN volume_metadata vm ON vm.root = ve.cid
-                JOIN closure c ON ve.root = c.root
-            ),
-            missing(root) AS (
-                SELECT c.root
-                FROM closure c
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM volume_entries ve WHERE ve.root = c.root
-                )
-                UNION
-                SELECT c.root
-                FROM closure c
-                JOIN volume_entries ve ON ve.root = c.root
+                JOIN cas_data cd ON cd.cid = ve.cid
+                WHERE ve.root = ?1 AND ve.cid = ?1
+            ) OR EXISTS (
+                SELECT 1 FROM volume_entries ve
                 LEFT JOIN cas_data cd ON cd.cid = ve.cid
-                WHERE cd.cid IS NULL
+                WHERE ve.root = ?1 AND cd.cid IS NULL
             )
-            SELECT root FROM missing LIMIT 1
+            LIMIT 1
             """
         guard sqlite3_prepare_v2(connection.db, sql, -1, &stmt, nil) == SQLITE_OK else {
             throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))

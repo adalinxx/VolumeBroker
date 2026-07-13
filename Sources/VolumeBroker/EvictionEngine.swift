@@ -25,67 +25,58 @@ struct EvictionEngine {
                     sqlite3_bind_text(stmt, 1, now, -1, SQLITE_TRANSIENT_SHIM)
                 }
                 let evictedRoots = unpinnedRoots(graceModifier: graceModifier, now: now)
-                // `protected` is the TRANSITIVE closure of cids reachable from a
-                // live pin or retained root: a root's entries, plus the entries
-                // of any reachable cid that is itself a volume root, recursively.
-                // The seed predicate is the same definition `PinIndex.isPinReachable`
-                // serves by, so the serve gate's TRUE set is always a subset of
-                // this protected set. (Expired pins are already deleted above;
-                // the TTL clause keeps the predicate self-contained.)
-                // `evictable` = roots that are NOT protected and past the grace.
+                // A pin protects exactly one Volume root and that Volume's direct
+                // entries. Related Volume roots are retained independently.
                 try connection.execBind("""
-                    WITH RECURSIVE protected(cid) AS (
+                    WITH live_roots(root) AS (
                         SELECT DISTINCT root FROM volume_pins
                         WHERE count > 0 AND (expires_at IS NULL OR expires_at > ?2)
                         UNION
                         SELECT root FROM retained_roots
+                    ),
+                    protected_cids(cid) AS (
+                        SELECT root FROM live_roots
                         UNION
                         SELECT ve.cid FROM volume_entries ve
-                        INNER JOIN protected pr ON ve.root = pr.cid
+                        INNER JOIN live_roots lr ON ve.root = lr.root
                     ),
                     evictable AS (
                         SELECT root FROM volume_metadata
-                        WHERE root NOT IN (SELECT cid FROM protected)
+                        WHERE root NOT IN (SELECT root FROM live_roots)
                           AND stored_at <= datetime('now', ?1)
                     )
                     DELETE FROM cas_data WHERE cid IN (
                         SELECT ve.cid FROM volume_entries ve
                         INNER JOIN evictable e ON ve.root = e.root
-                        WHERE ve.cid NOT IN (SELECT cid FROM protected)
+                        WHERE ve.cid NOT IN (SELECT cid FROM protected_cids)
                     )
                     """) { stmt in
                     sqlite3_bind_text(stmt, 1, graceModifier, -1, SQLITE_TRANSIENT_SHIM)
                     sqlite3_bind_text(stmt, 2, now, -1, SQLITE_TRANSIENT_SHIM)
                 }
                 try connection.execBind("""
-                    WITH RECURSIVE protected(cid) AS (
+                    WITH live_roots(root) AS (
                         SELECT DISTINCT root FROM volume_pins
                         WHERE count > 0 AND (expires_at IS NULL OR expires_at > ?2)
                         UNION
                         SELECT root FROM retained_roots
-                        UNION
-                        SELECT ve.cid FROM volume_entries ve
-                        INNER JOIN protected pr ON ve.root = pr.cid
                     )
                     DELETE FROM volume_entries
-                    WHERE root NOT IN (SELECT cid FROM protected)
+                    WHERE root NOT IN (SELECT root FROM live_roots)
                       AND root IN (SELECT root FROM volume_metadata WHERE stored_at <= datetime('now', ?1))
                     """) { stmt in
                     sqlite3_bind_text(stmt, 1, graceModifier, -1, SQLITE_TRANSIENT_SHIM)
                     sqlite3_bind_text(stmt, 2, now, -1, SQLITE_TRANSIENT_SHIM)
                 }
                 try connection.execBind("""
-                    WITH RECURSIVE protected(cid) AS (
+                    WITH live_roots(root) AS (
                         SELECT DISTINCT root FROM volume_pins
                         WHERE count > 0 AND (expires_at IS NULL OR expires_at > ?2)
                         UNION
                         SELECT root FROM retained_roots
-                        UNION
-                        SELECT ve.cid FROM volume_entries ve
-                        INNER JOIN protected pr ON ve.root = pr.cid
                     )
                     DELETE FROM volume_metadata
-                    WHERE root NOT IN (SELECT cid FROM protected) AND stored_at <= datetime('now', ?1)
+                    WHERE root NOT IN (SELECT root FROM live_roots) AND stored_at <= datetime('now', ?1)
                     """) { stmt in
                     sqlite3_bind_text(stmt, 1, graceModifier, -1, SQLITE_TRANSIENT_SHIM)
                     sqlite3_bind_text(stmt, 2, now, -1, SQLITE_TRANSIENT_SHIM)
@@ -103,17 +94,14 @@ struct EvictionEngine {
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
         let sql = """
-            WITH RECURSIVE protected(cid) AS (
+            WITH live_roots(root) AS (
                 SELECT DISTINCT root FROM volume_pins
                 WHERE count > 0 AND (expires_at IS NULL OR expires_at > ?2)
                 UNION
                 SELECT root FROM retained_roots
-                UNION
-                SELECT ve.cid FROM volume_entries ve
-                INNER JOIN protected pr ON ve.root = pr.cid
             )
             SELECT root FROM volume_metadata
-            WHERE root NOT IN (SELECT cid FROM protected)
+            WHERE root NOT IN (SELECT root FROM live_roots)
               AND stored_at <= datetime('now', ?1)
             """
         guard sqlite3_prepare_v2(connection.db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }

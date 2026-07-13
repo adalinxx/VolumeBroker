@@ -75,6 +75,7 @@ public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRoot
     }
 
     public func storeVolumeLocal(_ volume: SerializedVolume) async throws {
+        try volume.validate()
         let insertedAt = ContinuousClock.Instant.now
         lock.withWriteLock {
             let isNewRoot = state.volumes[volume.root] == nil
@@ -87,6 +88,7 @@ public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRoot
     }
 
     public func storeVolumesLocal(_ volumes: [SerializedVolume]) async throws {
+        for volume in volumes { try volume.validate() }
         let insertedAt = ContinuousClock.Instant.now
         lock.withWriteLock {
             for volume in volumes {
@@ -186,7 +188,7 @@ public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRoot
                 return
             }
             for root in canonicalRoots {
-                try Self.validateRetainedClosure(root: root, state: state)
+                try Self.validateRetainedVolume(root: root, state: state)
             }
             state.retainedRoots[scope] = Set(canonicalRoots)
             state.retainedRootOperations[operationID] = (scope, Self.operationPayload(kind: "replace", roots: canonicalRoots))
@@ -210,7 +212,7 @@ public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRoot
                 return
             }
             for root in canonicalRoots {
-                try Self.validateRetainedClosure(root: root, state: state)
+                try Self.validateRetainedVolume(root: root, state: state)
             }
             state.retainedRoots[scope, default: []].formUnion(canonicalRoots)
             state.retainedRootOperations[operationID] = (scope, Self.operationPayload(kind: "merge", roots: canonicalRoots))
@@ -306,17 +308,9 @@ public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRoot
         "\(kind):\(roots.joined(separator: "\n"))"
     }
 
-    private static func validateRetainedClosure(root: String, state: State) throws {
-        var checked = Set<String>()
-        var queue = [root]
-        while let current = queue.popLast() {
-            guard checked.insert(current).inserted else { continue }
-            guard let volume = state.volumes[current], !volume.entries.isEmpty else {
-                throw BrokerError.missingRetainedRoot(current)
-            }
-            for cid in volume.entries.keys where state.volumes[cid] != nil {
-                queue.append(cid)
-            }
+    private static func validateRetainedVolume(root: String, state: State) throws {
+        guard let volume = state.volumes[root], volume.entries[root] != nil else {
+            throw BrokerError.missingRetainedRoot(root)
         }
     }
 
@@ -334,13 +328,6 @@ public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRoot
             protected.formUnion(roots)
         }
 
-        var queue = Array(protected)
-        while let root = queue.popLast() {
-            guard let volume = state.volumes[root] else { continue }
-            for cid in volume.entries.keys where protected.insert(cid).inserted {
-                queue.append(cid)
-            }
-        }
         return protected
     }
 }

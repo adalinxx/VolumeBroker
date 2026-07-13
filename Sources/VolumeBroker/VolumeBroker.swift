@@ -25,7 +25,7 @@ public protocol VolumeBroker: AnyObject, Sendable {
 
 /// Optional durable-retention surface for brokers that can advance a named set
 /// of roots atomically. Retained roots are independent from owner/count pins and
-/// participate in the same serve/eviction protection closure.
+/// protect the same per-Volume entries from serving and eviction.
 public protocol RetainedRootBroker: VolumeBroker {
     func advanceRetainedRoots(scope: String, roots: [String], operationID: String) async throws
     func retainedRoots(scope: String) async -> [String]

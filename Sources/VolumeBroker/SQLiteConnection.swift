@@ -163,13 +163,6 @@ final class SQLiteConnection: @unchecked Sendable {
             )
             """)
         try execRaw(db: db, """
-            CREATE TABLE IF NOT EXISTS volume_edges (
-                parent_root TEXT NOT NULL,
-                child_root TEXT NOT NULL,
-                PRIMARY KEY (parent_root, child_root)
-            )
-            """)
-        try execRaw(db: db, """
             CREATE TABLE IF NOT EXISTS volume_pins (
                 root TEXT NOT NULL,
                 owner TEXT NOT NULL,
@@ -206,13 +199,14 @@ final class SQLiteConnection: @unchecked Sendable {
             """)
         try execRaw(db: db, "CREATE INDEX IF NOT EXISTS idx_ve_cid ON volume_entries(cid)")
         try execRaw(db: db, "CREATE INDEX IF NOT EXISTS idx_ve_root ON volume_entries(root)")
-        try execRaw(db: db, "CREATE INDEX IF NOT EXISTS idx_volume_edges_child ON volume_edges(child_root)")
-        try execRaw(db: db, "CREATE INDEX IF NOT EXISTS idx_volume_edges_parent ON volume_edges(parent_root)")
         try execRaw(db: db, "CREATE INDEX IF NOT EXISTS idx_retained_roots_root ON retained_roots(root)")
         // P-603: index owner for unpinAll/unpinAllBatch DELETE WHERE owner=? (was full-table scan)
         try execRaw(db: db, "CREATE INDEX IF NOT EXISTS idx_vp_owner ON volume_pins(owner)")
         // Owner-scoped root lookups power chain-local reannounce without scanning all pins.
         try execRaw(db: db, "CREATE INDEX IF NOT EXISTS idx_vp_owner_expires_root ON volume_pins(owner, expires_at, root)")
+        // Volume relationships live in content. Remove metadata created by builds
+        // that briefly duplicated nested-Volume edges in SQLite.
+        try execRaw(db: db, "DROP TABLE IF EXISTS volume_edges")
         // P-606: index expires_at for pinnedRoots() partial-index scan
         try execRaw(db: db, "CREATE INDEX IF NOT EXISTS idx_vp_expires ON volume_pins(expires_at)")
         try execRaw(db: db, """

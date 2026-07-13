@@ -41,7 +41,11 @@ let package = Package(
         ),
         .testTarget(
             name: "VolumeBrokerBenchmarks",
-            dependencies: ["VolumeBroker"]
+            dependencies: [
+                "VolumeBroker",
+                .product(name: "CID", package: "swift-cid"),
+                .product(name: "Multihash", package: "swift-multihash"),
+            ]
         ),
     ]
 )

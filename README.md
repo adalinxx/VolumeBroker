@@ -21,7 +21,7 @@ Sources/VolumeBroker/
   MemoryBroker.swift     In-memory LRU with capacity cap
   DiskBroker.swift       SQLite-backed durable storage
   BrokerFetcher.swift    cashew ContentSource (+ Fetcher) adapter
-  BrokerStorer.swift     cashew VolumeAwareStorer adapter (records owned-child edges)
+  BrokerStorer.swift     cashew VolumeAwareStorer adapter
   BrokerErrors.swift     Shared error types
 ```
 
@@ -50,7 +50,7 @@ public protocol VolumeBroker: AnyObject, Sendable {
 
 **Stores are explicit** — no default cascade. The caller decides which tier to write to (`storeVolumeLocal` on the target broker).
 
-**Content-addressed by CID** — `fetchData(cid:)` resolves any stored node by its CID from `cas_data`, regardless of which Volume it belongs to (cashew 3.x resolves per-CID over a `Fetcher`/`ContentSource`, not by entering a Volume root). `fetchVolume(root:)` still returns a whole Volume's entries for boundary-grain serving. `BrokerStorer` records owned-child edges (`volume_entries(parent → child)`) at each Volume boundary, so transitive eviction protects an object's whole owned closure from a single pin on its root.
+**Content-addressed by CID** — `fetchData(cid:)` resolves any stored node by its CID from `cas_data`, regardless of which Volume it belongs to (cashew 3.x resolves per-CID over a `Fetcher`/`ContentSource`, not by entering a Volume root). `fetchVolume(root:)` still returns a whole Volume's entries for boundary-grain serving. Volume relationships remain encoded in the application's content-addressed structures; the broker stores and retains each Volume independently.
 
 ## Usage
 
@@ -125,7 +125,7 @@ SQLite tables with WAL journaling:
 
 A schema migration (`ALTER TABLE volume_pins ADD COLUMN count INTEGER NOT NULL DEFAULT 1`) runs automatically on startup for existing databases.
 
-Eviction is a single transaction: prune pins whose TTL has expired, then delete the CAS data, entries, and metadata for any root not in the protected closure and older than the grace window (`evictUnpinnedGraceSeconds`, default 600). The protected closure is the transitive set of CIDs reachable through `volume_entries` from any live pin or retained root, so shared CAS blobs referenced by a protected root are never evicted. Eviction never decrements pin counts — that happens only in `unpin`/`unpinAll`.
+Eviction is a single transaction: prune pins whose TTL has expired, then delete the CAS data, entries, and metadata for any unprotected Volume older than the grace window (`evictUnpinnedGraceSeconds`, default 600). A live pin or retained root protects that Volume and its direct entries; related Volume roots must be protected explicitly. Shared CAS blobs that are direct entries of a protected Volume are never evicted. Eviction never decrements pin counts — that happens only in `unpin`/`unpinAll`.
 
 ## Requirements
 

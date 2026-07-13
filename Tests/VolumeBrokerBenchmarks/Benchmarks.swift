@@ -1,5 +1,7 @@
 import Testing
 import Foundation
+import CID
+import Multihash
 @testable import VolumeBroker
 
 private extension VolumeBroker {
@@ -13,13 +15,27 @@ struct Benchmarks {
 
     // MARK: - Helpers
 
+    private func cid(for data: Data) -> String {
+        let multihash = try! Multihash(raw: data, hashedWith: .sha2_256)
+        return try! CID(version: .v1, codec: .dag_cbor, multihash: multihash).toBaseEncodedString
+    }
+
+    private func cid(_ value: String) -> String {
+        cid(for: Data(value.utf8))
+    }
+
     private func payload(_ root: String, entryCount: Int, dataSize: Int = 64) -> SerializedVolume {
-        var entries: [String: Data] = [:]
+        let rootData = Data(root.utf8)
+        var entries = [cid(for: rootData): rootData]
         entries.reserveCapacity(entryCount)
-        for i in 0..<entryCount {
-            entries["\(root):cid-\(i)"] = Data(repeating: UInt8(i & 0xFF), count: dataSize)
+        for i in 1..<entryCount {
+            var data = Data("\(root):\(i):".utf8)
+            if data.count < dataSize {
+                data.append(Data(repeating: UInt8(i & 0xFF), count: dataSize - data.count))
+            }
+            entries[cid(for: data)] = data
         }
-        return SerializedVolume(root: root, entries: entries)
+        return SerializedVolume(root: cid(for: rootData), entries: entries)
     }
 
     private func tempDB() throws -> DiskBroker {
@@ -102,7 +118,7 @@ struct Benchmarks {
         }
         print("\n--- DiskBroker: Fetch volumes (20 entries each) ---")
         try await measure("fetch 1000 times", iterations: 1000) {
-            let _ = await broker.fetchVolumeLocal(root: "r-\(Int.random(in: 0..<100))")
+            let _ = await broker.fetchVolumeLocal(root: cid("r-\(Int.random(in: 0..<100))"))
         }
     }
 
@@ -113,7 +129,7 @@ struct Benchmarks {
         }
         print("\n--- DiskBroker: hasVolume checks ---")
         try await measure("hasVolume 10000 checks", iterations: 10000) {
-            let _ = await broker.hasVolume(root: "r-\(Int.random(in: 0..<200))")
+            let _ = await broker.hasVolume(root: cid("r-\(Int.random(in: 0..<200))"))
         }
     }
 
@@ -126,10 +142,10 @@ struct Benchmarks {
         }
         print("\n--- DiskBroker: Pin/unpin operations ---")
         try await measure("pin 1000 times", iterations: 1000) {
-            try await broker.pin(root: "r-\(Int.random(in: 0..<100))", owner: "owner-\(Int.random(in: 0..<10))")
+            try await broker.pin(root: cid("r-\(Int.random(in: 0..<100))"), owner: "owner-\(Int.random(in: 0..<10))")
         }
         try await measure("unpin 1000 times", iterations: 1000) {
-            try await broker.unpin(root: "r-\(Int.random(in: 0..<100))", owner: "owner-\(Int.random(in: 0..<10))")
+            try await broker.unpin(root: cid("r-\(Int.random(in: 0..<100))"), owner: "owner-\(Int.random(in: 0..<10))")
         }
     }
 
@@ -142,15 +158,15 @@ struct Benchmarks {
             try await broker.storeVolumeLocal(payload("r-\(i)", entryCount: 10))
         }
         for i in 0..<50 {
-            try await broker.pin(root: "r-\(i)", owner: "keeper")
+            try await broker.pin(root: cid("r-\(i)"), owner: "keeper")
         }
         try await measure("evict 450 unpinned volumes", iterations: 1) {
             // graceSeconds: 0 — exercise eviction mechanics, not the store-then-pin grace
             let evicted = try await broker.evictUnpinned(graceSeconds: 0)
             #expect(evicted == 450)
         }
-        #expect(await broker.hasVolume(root: "r-0"))
-        #expect(await broker.hasVolume(root: "r-499") == false)
+        #expect(await broker.hasVolume(root: cid("r-0")))
+        #expect(await broker.hasVolume(root: cid("r-499")) == false)
     }
 
     // MARK: - MemoryBroker LRU
@@ -163,7 +179,7 @@ struct Benchmarks {
             try await broker.storeVolumeLocal(p)
         }
         try await measure("fetch 5000 times", iterations: 5000) {
-            let _ = await broker.fetchVolumeLocal(root: "r-\(Int.random(in: 0..<10000))")
+            let _ = await broker.fetchVolumeLocal(root: cid("r-\(Int.random(in: 0..<10000))"))
         }
     }
 
@@ -174,7 +190,7 @@ struct Benchmarks {
             try await broker.storeVolumeLocal(payload("r-\(i)", entryCount: 5))
         }
         for i in 0..<100 {
-            try await broker.pin(root: "r-\(i)", owner: "keeper")
+            try await broker.pin(root: cid("r-\(i)"), owner: "keeper")
         }
         print("\n--- MemoryBroker: Evict 900 of 1000 volumes ---")
         try await measure("evictUnpinned", iterations: 1) {
@@ -209,7 +225,7 @@ struct Benchmarks {
                 for _ in 0..<4 {
                     group.addTask {
                         for _ in 0..<500 {
-                            let _ = await broker.fetchVolumeLocal(root: "r-\(Int.random(in: 0..<200))")
+                            let _ = await broker.fetchVolumeLocal(root: cid("r-\(Int.random(in: 0..<200))"))
                         }
                     }
                 }
@@ -233,15 +249,13 @@ struct Benchmarks {
                 for _ in 0..<3 {
                     group.addTask {
                         for _ in 0..<500 {
-                            let _ = await broker.fetchVolumeLocal(root: "r-\(Int.random(in: 0..<200))")
+                            let _ = await broker.fetchVolumeLocal(root: cid("r-\(Int.random(in: 0..<200))"))
                         }
                     }
                 }
                 group.addTask {
                     for i in 200..<400 {
-                        try? await broker.storeVolumeLocal(
-                            SerializedVolume(root: "w-\(i)", entries: ["w-\(i):c": Data([UInt8(i & 0xFF)])])
-                        )
+                        try? await broker.storeVolumeLocal(payload("w-\(i)", entryCount: 2))
                     }
                 }
             }
@@ -266,7 +280,7 @@ struct Benchmarks {
 
         print("\n--- Cascade: memory(50) → disk(200) fetch ---")
         try await measure("fetch 1000 (mix hit/miss)", iterations: 1000) {
-            let _ = await memory.fetchVolume(root: "r-\(Int.random(in: 0..<200))")
+            let _ = await memory.fetchVolume(root: cid("r-\(Int.random(in: 0..<200))"))
         }
     }
 }

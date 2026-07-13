@@ -45,23 +45,27 @@ public actor ContentStore {
     public func put<T: Node>(_ object: T) async throws -> String {
         let header = try VolumeImpl(node: object)
         let storer = BrokerStorer(broker: broker)
-        try header.storeRecursively(storer: storer)
+        do {
+            try header.storeRecursively(storer: storer)
+        } catch let traversalError {
+            // A nested Volume may fail after earlier independent scopes completed.
+            // Persist those scopes before reporting the nested failure.
+            try await storer.flush(root: header.rawCID)
+            throw traversalError
+        }
         try await storer.flush(root: header.rawCID)
         return header.rawCID
     }
 
     // MARK: - Retention
 
-    /// Retain an object under a reason (`owner`), refcounted. Pinning the object
-    /// root protects its whole reachable closure: eviction keeps the transitive
-    /// set of cids reachable from a pinned root, so a multi-volume object (e.g.
-    /// per-node state) is retained in full, not just the root node.
+    /// Retain one Volume root under a reason (`owner`), refcounted. Related Volume
+    /// roots are independent and must be retained explicitly by the application.
     public func retain(_ rootCID: String, owner: String) async throws {
         try await broker.pin(root: rootCID, owner: owner)
     }
 
-    /// Release one retention reason; the closure is evictable once no reason
-    /// (and no other pinned object's closure) keeps it.
+    /// Release one retention reason; this Volume is evictable once no reason keeps it.
     public func release(_ rootCID: String, owner: String) async throws {
         try await broker.unpin(root: rootCID, owner: owner)
     }

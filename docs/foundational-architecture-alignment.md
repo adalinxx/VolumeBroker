@@ -10,8 +10,9 @@ This change enforces the generic invariants the storage layer can own:
 4. an existing CID cannot silently map to conflicting bytes;
 5. completed Volume scopes close in stack order;
 6. an incomplete traversal cannot be collected or flushed as complete;
-7. a batch is validated before one atomic SQLite transaction.
+7. every broker validates a batch before mutating storage;
+8. legacy rows with missing root or CAS data are not reported as available.
 
 Nested Volumes remain independent availability units. Root presence does not imply availability of every nested Volume, and VolumeBroker does not attempt to certify application-level materialization.
 
-The tests cover malformed roots, CID mismatch, pre-write rejection, abort behavior, and unbalanced scopes.
+The tests cover malformed roots, CID mismatch, pre-write rejection in both broker implementations, abort behavior, unbalanced scopes, and legacy partial-row rejection.
