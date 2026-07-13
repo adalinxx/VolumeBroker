@@ -13,10 +13,16 @@ public final class BrokerStorer: VolumeAwareStorer, @unchecked Sendable {
 
     public private(set) var storedRoots: [String] = []
 
-    /// Collect all pending serialized volumes without flushing them to storage.
-    /// Use this when the caller wants to accumulate volumes from multiple
-    /// storers and write them all in one `storeVolumesLocal` call.
-    public func collectVolumes(root: String) -> [SerializedVolume] {
+    /// Active scopes are exposed read-only for diagnostics and invariant tests.
+    public var openVolumeRoots: [String] { scopeStack.map(\.root) }
+
+    /// Collect completed serialized Volumes without flushing them to storage.
+    /// Throws if a traversal is still open: returning pending data in that state
+    /// would let a caller publish a partially traversed outer Volume.
+    public func collectCompleteVolumes(root: String) throws -> [SerializedVolume] {
+        guard scopeStack.isEmpty else {
+            throw BrokerError.incompleteVolumeScopes(scopeStack.map(\.root))
+        }
         var volumes: [SerializedVolume] = []
         for pending in pendingVolumes {
             volumes.append(SerializedVolume(root: pending.root, entries: pending.entries))
@@ -31,6 +37,13 @@ public final class BrokerStorer: VolumeAwareStorer, @unchecked Sendable {
         return volumes
     }
 
+    /// Compatibility wrapper. It fails closed (returns no Volumes) while a scope
+    /// remains open; new code should use ``collectCompleteVolumes(root:)`` so the
+    /// lifecycle error is explicit.
+    public func collectVolumes(root: String) -> [SerializedVolume] {
+        (try? collectCompleteVolumes(root: root)) ?? []
+    }
+
     public init(broker: any VolumeBroker) {
         self.broker = broker
     }
@@ -42,9 +55,13 @@ public final class BrokerStorer: VolumeAwareStorer, @unchecked Sendable {
     }
 
     public func exitVolume(rootCID: String) throws {
-        guard let idx = scopeStack.indices.last, scopeStack[idx].root == rootCID else { return }
+        let expected = scopeStack.last?.root
+        guard expected == rootCID else {
+            throw BrokerError.unbalancedVolumeScope(expected: expected, actual: rootCID)
+        }
         let scope = scopeStack.removeLast()
         pendingVolumes.append((root: scope.root, entries: scope.buffer))
+
         // Record the reachability edge parent → child: copy the child's own
         // root node up into the parent scope so flush writes a
         // `volume_entries(parent, child)` row. This makes `volume_entries` a
@@ -53,18 +70,20 @@ public final class BrokerStorer: VolumeAwareStorer, @unchecked Sendable {
         // bracketed closure in one pin — no per-node enumeration.
         //
         // The graph spans exactly what cashew's `storeRecursively` brackets with
-        // enter/exit, i.e. the caller's *owned* children. To keep the graph from
-        // climbing backward into unrelated history (e.g. a block's parent/prev
-        // state), the CALLER must model such back/shared links as a cashew
-        // `Reference` (not a child Header) so they are never bracketed and never
-        // edged here. VolumeBroker edges whatever is bracketed; it cannot tell
-        // owned from referenced — that distinction lives in the consumer's types.
-        //
-        // Child bytes dedup against the child's own volume via `INSERT OR IGNORE`.
+        // enter/exit, i.e. the caller's owned children. Back/shared links must be
+        // represented as cashew `Reference` values so they are never edged here.
         if let parentIdx = scopeStack.indices.last,
            let childBytes = scope.buffer[scope.root] {
             scopeStack[parentIdx].buffer[scope.root] = childBytes
         }
+    }
+
+    /// Discard a failed scope and any still-open nested scopes. Completed child
+    /// Volumes remain pending because each completed Volume is independently
+    /// atomic; only the incomplete traversal is abandoned.
+    public func abortVolume(rootCID: String) {
+        guard let index = scopeStack.lastIndex(where: { $0.root == rootCID }) else { return }
+        scopeStack.removeSubrange(index...)
     }
 
     // MARK: - Storer
@@ -82,27 +101,15 @@ public final class BrokerStorer: VolumeAwareStorer, @unchecked Sendable {
         return scopeStack.contains { $0.buffer[rawCid] != nil }
     }
 
-    /// Flush all pending volumes to the broker in a single call.
-    /// Internal entries are only resolvable after entering their volume root;
-    /// they are not stored as independently fetchable volumes.
-    /// Collects every volume boundary buffer into one slice and calls
-    /// `storeVolumesLocal` once, allowing the broker (DiskBroker) to commit
-    /// all writes in a single SQLite transaction instead of one per Volume.
+    /// Flush all completed Volumes in one broker transaction. An open scope is a
+    /// hard lifecycle error: no partial outer Volume is persisted.
     public func flush(root: String) async throws {
-        var allVolumes: [SerializedVolume] = []
-        allVolumes.reserveCapacity(pendingVolumes.count + 1)
-        for pending in pendingVolumes {
-            allVolumes.append(SerializedVolume(root: pending.root, entries: pending.entries))
-            storedRoots.append(pending.root)
+        guard scopeStack.isEmpty else {
+            throw BrokerError.incompleteVolumeScopes(scopeStack.map(\.root))
         }
-        if !flatBuffer.isEmpty {
-            allVolumes.append(SerializedVolume(root: root, entries: flatBuffer))
-            storedRoots.append(root)
-        }
+        let allVolumes = try collectCompleteVolumes(root: root)
         if !allVolumes.isEmpty {
             try await broker.storeVolumesLocal(allVolumes)
         }
-        pendingVolumes = []
-        flatBuffer = [:]
     }
 }
