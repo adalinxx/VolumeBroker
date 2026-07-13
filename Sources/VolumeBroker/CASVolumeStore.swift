@@ -7,9 +7,10 @@ import VolumeBrokerSQLite
 
 /// Content-addressed volume store.
 ///
-/// Owns the `cas_data`, `volume_entries`, and `volume_metadata` tables: storing
-/// serialized volumes, fetching them back, and reporting presence. Eviction and
-/// pin layers read these tables but only this layer writes them on the store path.
+/// Owns the `cas_data`, `volume_entries`, `volume_edges`, and `volume_metadata`
+/// tables: storing serialized Volumes, fetching them back, and reporting presence.
+/// Eviction and pin layers read these tables but only this layer writes them on the
+/// store path.
 struct CASVolumeStore {
     let connection: SQLiteConnection
     let negativeCache: NegativeCache
@@ -32,33 +33,57 @@ struct CASVolumeStore {
     /// declared root entry is present in the returned complete entry set.
     func fetchVolumeLocal(root: String) async -> SerializedVolume? {
         await connection.read {
-            var stmt: OpaquePointer?
-            defer { sqlite3_finalize(stmt) }
-            let sql = """
+            var entryStmt: OpaquePointer?
+            defer { sqlite3_finalize(entryStmt) }
+            let entrySQL = """
                 SELECT ve.cid, cd.data FROM volume_entries ve
                 JOIN cas_data cd ON cd.cid = ve.cid
                 WHERE ve.root = ?1
                 """
-            guard sqlite3_prepare_v2(connection.readDb, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
-            sqlite3_bind_text(stmt, 1, root, -1, SQLITE_TRANSIENT_SHIM)
+            guard sqlite3_prepare_v2(connection.readDb, entrySQL, -1, &entryStmt, nil) == SQLITE_OK else { return nil }
+            sqlite3_bind_text(entryStmt, 1, root, -1, SQLITE_TRANSIENT_SHIM)
+
             var entries: [String: Data] = [:]
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                guard let cidPtr = sqlite3_column_text(stmt, 0) else { continue }
+            while sqlite3_step(entryStmt) == SQLITE_ROW {
+                guard let cidPtr = sqlite3_column_text(entryStmt, 0) else { continue }
                 let cid = String(cString: cidPtr)
-                let len = Int(sqlite3_column_bytes(stmt, 1))
+                let len = Int(sqlite3_column_bytes(entryStmt, 1))
                 if len == 0 {
                     entries[cid] = Data()
-                } else if let blobPtr = sqlite3_column_blob(stmt, 1) {
+                } else if let blobPtr = sqlite3_column_blob(entryStmt, 1) {
                     entries[cid] = Data(bytes: blobPtr, count: len)
                 }
             }
             guard entries[root] != nil else { return nil }
-            return SerializedVolume(root: root, entries: entries)
+
+            var edgeStmt: OpaquePointer?
+            defer { sqlite3_finalize(edgeStmt) }
+            guard sqlite3_prepare_v2(
+                connection.readDb,
+                "SELECT child_root FROM volume_edges WHERE parent_root=?1",
+                -1,
+                &edgeStmt,
+                nil
+            ) == SQLITE_OK else { return nil }
+            sqlite3_bind_text(edgeStmt, 1, root, -1, SQLITE_TRANSIENT_SHIM)
+
+            var nestedVolumeRoots = Set<String>()
+            while sqlite3_step(edgeStmt) == SQLITE_ROW {
+                if let childPtr = sqlite3_column_text(edgeStmt, 0) {
+                    nestedVolumeRoots.insert(String(cString: childPtr))
+                }
+            }
+
+            return SerializedVolume(
+                root: root,
+                entries: entries,
+                nestedVolumeRoots: nestedVolumeRoots
+            )
         }
     }
 
     /// Direct content-by-CID lookup against `cas_data` — resolves any stored
-    /// node, not just volume roots.
+    /// node, not just Volume roots.
     func fetchDataLocal(cid: String) async -> Data? {
         await connection.read {
             var stmt: OpaquePointer?
@@ -82,11 +107,7 @@ struct CASVolumeStore {
         try await connection.write {
             try connection.transaction {
                 for volume in volumes {
-                    try upsertMetadata(root: volume.root)
-                    for (cid, data) in volume.entries {
-                        try upsertCASData(cid: cid, data: data)
-                        try insertVolumeEntry(root: volume.root, cid: cid)
-                    }
+                    try store(volume)
                 }
             }
         }
@@ -97,17 +118,31 @@ struct CASVolumeStore {
         try volume.validate()
         try await connection.write {
             try connection.transaction {
-                try upsertMetadata(root: volume.root)
-                for (cid, data) in volume.entries {
-                    try upsertCASData(cid: cid, data: data)
-                    try insertVolumeEntry(root: volume.root, cid: cid)
-                }
+                try store(volume)
             }
         }
         negativeCache.recordStored(volume.root)
     }
 
     // MARK: - Row helpers (write connection; call inside a transaction)
+
+    private func store(_ volume: SerializedVolume) throws {
+        try upsertMetadata(root: volume.root)
+        for (cid, data) in volume.entries {
+            try upsertCASData(cid: cid, data: data)
+            try insertVolumeEntry(root: volume.root, cid: cid)
+        }
+
+        // The explicit edge set is part of the immutable serialized Volume value.
+        // Replace it atomically so re-storage cannot leave stale hydration-derived
+        // edges from an older implementation.
+        try connection.execBind("DELETE FROM volume_edges WHERE parent_root=?1") { stmt in
+            sqlite3_bind_text(stmt, 1, volume.root, -1, SQLITE_TRANSIENT_SHIM)
+        }
+        for nestedRoot in volume.nestedVolumeRoots {
+            try insertVolumeEdge(parentRoot: volume.root, childRoot: nestedRoot)
+        }
+    }
 
     /// Insert immutable content, or verify that an existing row is byte-identical.
     /// `INSERT OR IGNORE` alone would silently hide database corruption.
@@ -152,6 +187,13 @@ struct CASVolumeStore {
         try connection.execBind("INSERT OR IGNORE INTO volume_entries(root, cid) VALUES(?1, ?2)") { stmt in
             sqlite3_bind_text(stmt, 1, root, -1, SQLITE_TRANSIENT_SHIM)
             sqlite3_bind_text(stmt, 2, cid, -1, SQLITE_TRANSIENT_SHIM)
+        }
+    }
+
+    private func insertVolumeEdge(parentRoot: String, childRoot: String) throws {
+        try connection.execBind("INSERT OR IGNORE INTO volume_edges(parent_root, child_root) VALUES(?1, ?2)") { stmt in
+            sqlite3_bind_text(stmt, 1, parentRoot, -1, SQLITE_TRANSIENT_SHIM)
+            sqlite3_bind_text(stmt, 2, childRoot, -1, SQLITE_TRANSIENT_SHIM)
         }
     }
 
