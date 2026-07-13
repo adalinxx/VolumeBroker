@@ -8,8 +8,12 @@ let package = Package(
         .library(name: "VolumeBroker", targets: ["VolumeBroker"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/adalinxx/cashew.git", from: "3.0.0"),
+        // Stacked with the cashew atomic-Volume lifecycle PR. Replace with its
+        // release tag before merging this coordinated redesign series.
+        .package(url: "https://github.com/adalinxx/cashew.git", branch: "agent/foundational-architecture-alignment"),
         .package(url: "https://github.com/adalinxx/ArrayTrie.git", from: "1.0.0"),
+        .package(url: "https://github.com/swift-libp2p/swift-cid.git", from: "0.0.1"),
+        .package(url: "https://github.com/swift-libp2p/swift-multihash.git", from: "0.0.1"),
     ],
     targets: [
         .target(
@@ -23,11 +27,17 @@ let package = Package(
                 "VolumeBrokerSQLite",
                 .product(name: "cashew", package: "cashew"),
                 .product(name: "ArrayTrie", package: "ArrayTrie"),
+                .product(name: "CID", package: "swift-cid"),
+                .product(name: "Multihash", package: "swift-multihash"),
             ]
         ),
         .testTarget(
             name: "VolumeBrokerTests",
-            dependencies: ["VolumeBroker"]
+            dependencies: [
+                "VolumeBroker",
+                .product(name: "CID", package: "swift-cid"),
+                .product(name: "Multihash", package: "swift-multihash"),
+            ]
         ),
         .testTarget(
             name: "VolumeBrokerBenchmarks",
