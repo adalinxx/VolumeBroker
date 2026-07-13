@@ -2,14 +2,27 @@ import Foundation
 import cashew
 
 public final class BrokerStorer: VolumeAwareStorer, @unchecked Sendable {
+    private struct Scope {
+        let root: String
+        var buffer: [String: Data]
+        var nestedVolumeRoots: Set<String>
+    }
+
+    private struct PendingVolume {
+        let root: String
+        let entries: [String: Data]
+        let nestedVolumeRoots: Set<String>
+    }
+
     private let broker: any VolumeBroker
-    // Stack of volume scopes pushed by enterVolume. Each scope accumulates
-    // data for one Volume boundary. exitVolume pops and queues it for flush.
-    private var scopeStack: [(root: String, buffer: [String: Data])] = []
+    // Stack of Volume scopes pushed by enterVolume. Each scope accumulates the
+    // ordinary bytes and explicit nested-boundary edges for one complete Volume.
+    private var scopeStack: [Scope] = []
     // Volumes completed via exitVolume, waiting for async flush.
-    private var pendingVolumes: [(root: String, entries: [String: Data])] = []
-    // Fallback buffer for callers that use store() without enterVolume.
+    private var pendingVolumes: [PendingVolume] = []
+    // Fallback state for callers that use store() without entering a Volume.
     private var flatBuffer: [String: Data] = [:]
+    private var flatNestedVolumeRoots = Set<String>()
 
     public private(set) var storedRoots: [String] = []
 
@@ -23,17 +36,29 @@ public final class BrokerStorer: VolumeAwareStorer, @unchecked Sendable {
         guard scopeStack.isEmpty else {
             throw BrokerError.incompleteVolumeScopes(scopeStack.map(\.root))
         }
+
         var volumes: [SerializedVolume] = []
         for pending in pendingVolumes {
-            volumes.append(SerializedVolume(root: pending.root, entries: pending.entries))
+            volumes.append(SerializedVolume(
+                root: pending.root,
+                entries: pending.entries,
+                nestedVolumeRoots: pending.nestedVolumeRoots
+            ))
             storedRoots.append(pending.root)
         }
-        if !flatBuffer.isEmpty {
-            volumes.append(SerializedVolume(root: root, entries: flatBuffer))
+
+        if !flatBuffer.isEmpty || !flatNestedVolumeRoots.isEmpty {
+            volumes.append(SerializedVolume(
+                root: root,
+                entries: flatBuffer,
+                nestedVolumeRoots: flatNestedVolumeRoots
+            ))
             storedRoots.append(root)
         }
+
         pendingVolumes = []
         flatBuffer = [:]
+        flatNestedVolumeRoots = []
         return volumes
     }
 
@@ -51,7 +76,19 @@ public final class BrokerStorer: VolumeAwareStorer, @unchecked Sendable {
     // MARK: - VolumeAwareStorer
 
     public func enterVolume(rootCID: String) throws {
-        scopeStack.append((root: rootCID, buffer: [:]))
+        scopeStack.append(Scope(
+            root: rootCID,
+            buffer: [:],
+            nestedVolumeRoots: []
+        ))
+    }
+
+    public func includeNestedVolume(rootCID: String) throws {
+        if scopeStack.isEmpty {
+            flatNestedVolumeRoots.insert(rootCID)
+        } else {
+            scopeStack[scopeStack.count - 1].nestedVolumeRoots.insert(rootCID)
+        }
     }
 
     public func exitVolume(rootCID: String) throws {
@@ -59,23 +96,13 @@ public final class BrokerStorer: VolumeAwareStorer, @unchecked Sendable {
         guard expected == rootCID else {
             throw BrokerError.unbalancedVolumeScope(expected: expected, actual: rootCID)
         }
-        let scope = scopeStack.removeLast()
-        pendingVolumes.append((root: scope.root, entries: scope.buffer))
 
-        // Record the reachability edge parent → child: copy the child's own
-        // root node up into the parent scope so flush writes a
-        // `volume_entries(parent, child)` row. This makes `volume_entries` a
-        // true reachability graph over the volume boundaries the caller
-        // bracketed, so transitive eviction protects a pinned root's whole
-        // bracketed closure in one pin — no per-node enumeration.
-        //
-        // The graph spans exactly what cashew's `storeRecursively` brackets with
-        // enter/exit, i.e. the caller's owned children. Back/shared links must be
-        // represented as cashew `Reference` values so they are never edged here.
-        if let parentIdx = scopeStack.indices.last,
-           let childBytes = scope.buffer[scope.root] {
-            scopeStack[parentIdx].buffer[scope.root] = childBytes
-        }
+        let scope = scopeStack.removeLast()
+        pendingVolumes.append(PendingVolume(
+            root: scope.root,
+            entries: scope.buffer,
+            nestedVolumeRoots: scope.nestedVolumeRoots
+        ))
     }
 
     /// Discard a failed scope and any still-open nested scopes. Completed child
