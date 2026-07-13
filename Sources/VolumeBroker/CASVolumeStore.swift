@@ -16,24 +16,20 @@ struct CASVolumeStore {
 
     func hasVolume(root: String) async -> Bool {
         await connection.read {
-            // Fast-path: bloom says this root was previously confirmed absent AND we
-            // haven't stored it recently. This eliminates the SQLite round-trip for
-            // ~99.9% of misses during initial sync, where most CIDs haven't been
-            // downloaded yet.
             if negativeCache.mightBeAbsent(root) { return false }
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
             guard sqlite3_prepare_v2(connection.readDb, "SELECT 1 FROM volume_metadata WHERE root=?1 LIMIT 1", -1, &stmt, nil) == SQLITE_OK else { return false }
             sqlite3_bind_text(stmt, 1, root, -1, SQLITE_TRANSIENT_SHIM)
             let found = sqlite3_step(stmt) == SQLITE_ROW
-            if !found {
-                negativeCache.recordAbsent(root)
-            }
+            if !found { negativeCache.recordAbsent(root) }
             return found
         }
     }
 
     /// Uses the dedicated read-only WAL connection — concurrent with writes.
+    /// Legacy/incomplete rows fail closed: a Volume is available only when its
+    /// declared root entry is present in the returned complete entry set.
     func fetchVolumeLocal(root: String) async -> SerializedVolume? {
         await connection.read {
             var stmt: OpaquePointer?
@@ -47,13 +43,16 @@ struct CASVolumeStore {
             sqlite3_bind_text(stmt, 1, root, -1, SQLITE_TRANSIENT_SHIM)
             var entries: [String: Data] = [:]
             while sqlite3_step(stmt) == SQLITE_ROW {
-                guard let cidPtr = sqlite3_column_text(stmt, 0),
-                      let blobPtr = sqlite3_column_blob(stmt, 1) else { continue }
+                guard let cidPtr = sqlite3_column_text(stmt, 0) else { continue }
                 let cid = String(cString: cidPtr)
                 let len = Int(sqlite3_column_bytes(stmt, 1))
-                entries[cid] = Data(bytes: blobPtr, count: len)
+                if len == 0 {
+                    entries[cid] = Data()
+                } else if let blobPtr = sqlite3_column_blob(stmt, 1) {
+                    entries[cid] = Data(bytes: blobPtr, count: len)
+                }
             }
-            guard !entries.isEmpty else { return nil }
+            guard entries[root] != nil else { return nil }
             return SerializedVolume(root: root, entries: entries)
         }
     }
@@ -67,16 +66,19 @@ struct CASVolumeStore {
             let sql = "SELECT data FROM cas_data WHERE cid = ?1"
             guard sqlite3_prepare_v2(connection.readDb, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
             sqlite3_bind_text(stmt, 1, cid, -1, SQLITE_TRANSIENT_SHIM)
-            guard sqlite3_step(stmt) == SQLITE_ROW, let blobPtr = sqlite3_column_blob(stmt, 0) else { return nil }
+            guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
             let len = Int(sqlite3_column_bytes(stmt, 0))
+            if len == 0 { return Data() }
+            guard let blobPtr = sqlite3_column_blob(stmt, 0) else { return nil }
             return Data(bytes: blobPtr, count: len)
         }
     }
 
-    /// Store multiple serialized volumes in a single SQLite transaction.
+    /// Store multiple complete serialized Volumes in a single SQLite transaction.
+    /// Validation occurs before any write, so one malformed Volume aborts the batch.
     func storeVolumesLocal(_ volumes: [SerializedVolume]) async throws {
         guard !volumes.isEmpty else { return }
-        for volume in volumes { negativeCache.recordStored(volume.root) }
+        for volume in volumes { try volume.validate() }
         try await connection.write {
             try connection.transaction {
                 for volume in volumes {
@@ -88,10 +90,11 @@ struct CASVolumeStore {
                 }
             }
         }
+        for volume in volumes { negativeCache.recordStored(volume.root) }
     }
 
     func storeVolumeLocal(_ volume: SerializedVolume) async throws {
-        negativeCache.recordStored(volume.root)
+        try volume.validate()
         try await connection.write {
             try connection.transaction {
                 try upsertMetadata(root: volume.root)
@@ -101,16 +104,40 @@ struct CASVolumeStore {
                 }
             }
         }
+        negativeCache.recordStored(volume.root)
     }
 
     // MARK: - Row helpers (write connection; call inside a transaction)
 
+    /// Insert immutable content, or verify that an existing row is byte-identical.
+    /// `INSERT OR IGNORE` alone would silently hide database corruption.
     private func upsertCASData(cid: String, data: Data) throws {
+        var lookup: OpaquePointer?
+        defer { sqlite3_finalize(lookup) }
+        guard sqlite3_prepare_v2(connection.db, "SELECT data FROM cas_data WHERE cid = ?1 LIMIT 1", -1, &lookup, nil) == SQLITE_OK,
+              let lookup else {
+            throw BrokerError.sqlFailed("prepare existing content lookup")
+        }
+        sqlite3_bind_text(lookup, 1, cid, -1, SQLITE_TRANSIENT_SHIM)
+        if sqlite3_step(lookup) == SQLITE_ROW {
+            let len = Int(sqlite3_column_bytes(lookup, 0))
+            let existing: Data
+            if len == 0 {
+                existing = Data()
+            } else if let ptr = sqlite3_column_blob(lookup, 0) {
+                existing = Data(bytes: ptr, count: len)
+            } else {
+                throw BrokerError.sqlFailed("read existing content")
+            }
+            guard existing == data else { throw BrokerError.conflictingContent(cid) }
+            return
+        }
+
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
-        let sql = "INSERT OR IGNORE INTO cas_data(cid, data) VALUES(?1, ?2)"
+        let sql = "INSERT INTO cas_data(cid, data) VALUES(?1, ?2)"
         guard sqlite3_prepare_v2(connection.db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
-            throw BrokerError.sqlFailed("prepare")
+            throw BrokerError.sqlFailed("prepare content insert")
         }
         sqlite3_bind_text(stmt, 1, cid, -1, SQLITE_TRANSIENT_SHIM)
         _ = data.withUnsafeBytes { buf in
