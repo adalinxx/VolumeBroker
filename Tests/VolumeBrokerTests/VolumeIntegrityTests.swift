@@ -59,7 +59,8 @@ final class VolumeIntegrityTests: XCTestCase {
         } catch {
             XCTAssertEqual(error as? SerializedVolumeError, .contentAddressMismatch(root))
         }
-        XCTAssertFalse(await broker.hasVolume(root: root))
+        let present = await broker.hasVolume(root: root)
+        XCTAssertFalse(present)
     }
 
     func testAbortedScopeCannotBeCollectedAsACompleteVolume() throws {
