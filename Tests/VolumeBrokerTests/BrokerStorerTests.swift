@@ -1,7 +1,7 @@
-import Testing
-import Foundation
 import CID
+import Foundation
 import Multihash
+import Testing
 @testable import VolumeBroker
 
 @Suite("BrokerStorer")
@@ -21,14 +21,11 @@ struct BrokerStorerTests {
             await backing.fetchVolumeLocal(root: root)
         }
         func storeVolumeLocal(_ volume: SerializedVolume) async throws {
-            try await storeVolumesLocal([volume])
-        }
-        func storeVolumesLocal(_ volumes: [SerializedVolume]) async throws {
             if failNextStore {
                 failNextStore = false
                 throw InjectedFailure.store
             }
-            try await backing.storeVolumesLocal(volumes)
+            try await backing.storeVolumeLocal(volume)
         }
         func pin(root: String, owner: String, count: Int, ttl: Duration?) async throws {
             try await backing.pin(root: root, owner: owner, count: count, ttl: ttl)
@@ -46,7 +43,7 @@ struct BrokerStorerTests {
         return try! CID(version: .v1, codec: .dag_cbor, multihash: multihash).toBaseEncodedString
     }
 
-    @Test func flushStoresOnlyVolumeRoots() async throws {
+    @Test func storesOneCompleteVolumeDirectly() async throws {
         let broker = MemoryBroker()
         let storer = BrokerStorer(broker: broker)
         let rootData = Data("root-data".utf8)
@@ -54,120 +51,53 @@ struct BrokerStorerTests {
         let root = cid(for: rootData)
         let child = cid(for: childData)
 
-        try storer.enterVolume(rootCID: root)
-        try storer.store(rawCid: root, data: rootData)
-        try storer.store(rawCid: child, data: childData)
-        try storer.exitVolume(rootCID: root)
-        try await storer.flush(root: root)
+        try await storer.store(volume: SerializedVolume(
+            root: root,
+            entries: [root: rootData, child: childData]
+        ))
 
-        let rootVolume = await broker.fetchVolumeLocal(root: root)
-        let childVolume = await broker.fetchVolumeLocal(root: child)
-
-        #expect(rootVolume?.entries[root] == rootData)
-        #expect(rootVolume?.entries[child] == childData)
-        #expect(childVolume == nil)
-        #expect(storer.storedRoots == [root])
+        let stored = await broker.fetchVolumeLocal(root: root)
+        #expect(stored?.entries[root] == rootData)
+        #expect(stored?.entries[child] == childData)
+        #expect(await broker.fetchVolumeLocal(root: child) == nil)
     }
 
-    @Test func collectVolumesReturnsOnlyVolumeRoots() throws {
-        let storer = BrokerStorer(broker: MemoryBroker())
-        let rootData = Data("root-data".utf8)
-        let childData = Data("child-data".utf8)
-        let root = cid(for: rootData)
-        let child = cid(for: childData)
-
-        try storer.enterVolume(rootCID: root)
-        try storer.store(rawCid: root, data: rootData)
-        try storer.store(rawCid: child, data: childData)
-        try storer.exitVolume(rootCID: root)
-
-        let volumes = storer.collectVolumes(root: root)
-
-        #expect(volumes.map(\.root) == [root])
-        #expect(volumes.first?.entries[child] == childData)
-        #expect(storer.storedRoots == [root])
-    }
-
-    @Test func relatedVolumesRemainIndependent() async throws {
+    @Test func volumePayloadsRemainIndependent() async throws {
         let broker = MemoryBroker()
         let storer = BrokerStorer(broker: broker)
-        let objData = Data("obj".utf8)
+        let outerData = Data("outer".utf8)
         let nestedData = Data("nested".utf8)
         let deepData = Data("deep".utf8)
-        let obj = cid(for: objData)
+        let outer = cid(for: outerData)
         let nested = cid(for: nestedData)
         let deep = cid(for: deepData)
 
-        // Cashew completes the parent before storing a materialized nested Volume.
-        try storer.enterVolume(rootCID: obj)
-        try storer.store(rawCid: obj, data: objData)
-        try storer.exitVolume(rootCID: obj)
-        try storer.enterVolume(rootCID: nested)
-        try storer.store(rawCid: nested, data: nestedData)
-        try storer.store(rawCid: deep, data: deepData)
-        try storer.exitVolume(rootCID: nested)
-        try await storer.flush(root: obj)
+        try await storer.store(volume: SerializedVolume(root: outer, entries: [outer: outerData]))
+        try await storer.store(volume: SerializedVolume(
+            root: nested,
+            entries: [nested: nestedData, deep: deepData]
+        ))
 
-        let objVolume = await broker.fetchVolumeLocal(root: obj)
-        let nestedVolume = await broker.fetchVolumeLocal(root: nested)
-
-        #expect(objVolume?.entries[obj] == objData)
-        #expect(objVolume?.entries[nested] == nil)
-        #expect(nestedVolume?.entries[nested] == nestedData)
-        #expect(nestedVolume?.entries[deep] == deepData)
-        #expect(objVolume?.entries[deep] == nil)
+        #expect(await broker.fetchVolumeLocal(root: outer)?.entries[nested] == nil)
+        #expect(await broker.fetchVolumeLocal(root: nested)?.entries[deep] == deepData)
     }
 
-    @Test func exitWithoutRootFailsClosed() throws {
-        let broker = MemoryBroker()
-        let storer = BrokerStorer(broker: broker)
-
-        try storer.enterVolume(rootCID: "empty")
-        do {
-            try storer.exitVolume(rootCID: "empty")
-            Issue.record("expected a missing-root failure")
-        } catch {
-            #expect(error as? SerializedVolumeError == .missingRootEntry("empty"))
-        }
-        #expect(storer.openVolumeRoots == ["empty"])
-    }
-
-    @Test func collectVolumesIncludesZeroByteRoot() throws {
-        let storer = BrokerStorer(broker: MemoryBroker())
-        let rootData = Data()
-        let root = cid(for: rootData)
-
-        try storer.enterVolume(rootCID: root)
-        try storer.store(rawCid: root, data: rootData)
-        try storer.exitVolume(rootCID: root)
-
-        let volumes = storer.collectVolumes(root: root)
-
-        #expect(volumes.count == 1)
-        #expect(volumes.first?.root == root)
-        #expect(volumes.first?.entries[root] == Data())
-        #expect(storer.storedRoots == [root])
-    }
-
-    @Test func failedFlushKeepsCompletedVolumesForRetry() async throws {
+    @Test func failedStoreHasNoAdapterStateAndCanBeResubmitted() async throws {
         let broker = FlakyBroker()
         let storer = BrokerStorer(broker: broker)
-        let rootData = Data("retry".utf8)
-        let root = cid(for: rootData)
-        try storer.enterVolume(rootCID: root)
-        try storer.store(rawCid: root, data: rootData)
-        try storer.exitVolume(rootCID: root)
+        let data = Data("retry".utf8)
+        let root = cid(for: data)
+        let volume = SerializedVolume(root: root, entries: [root: data])
 
         do {
-            try await storer.flush(root: root)
-            Issue.record("expected the first flush to fail")
+            try await storer.store(volume: volume)
+            Issue.record("expected the first store to fail")
         } catch {
             #expect(error as? InjectedFailure == .store)
         }
-        #expect(storer.storedRoots.isEmpty)
+        #expect(await broker.hasVolume(root: root) == false)
 
-        try await storer.flush(root: root)
+        try await storer.store(volume: volume)
         #expect(await broker.hasVolume(root: root))
-        #expect(storer.storedRoots == [root])
     }
 }

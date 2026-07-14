@@ -8,7 +8,7 @@ let package = Package(
         .library(name: "VolumeBroker", targets: ["VolumeBroker"]),
     ],
     dependencies: [
-        // Stacked with the cashew atomic-Volume lifecycle PR. Replace with its
+        // Stacked with the cashew targeted-Volume storage PR. Replace with its
         // release tag before merging this coordinated redesign series.
         .package(url: "https://github.com/adalinxx/cashew.git", branch: "agent/foundational-architecture-alignment"),
         .package(url: "https://github.com/adalinxx/ArrayTrie.git", from: "1.0.0"),

@@ -21,7 +21,7 @@ Sources/VolumeBroker/
   MemoryBroker.swift     In-memory LRU with capacity cap
   DiskBroker.swift       SQLite-backed durable storage
   BrokerFetcher.swift    cashew ContentSource (+ Fetcher) adapter
-  BrokerStorer.swift     cashew VolumeAwareStorer adapter
+  BrokerStorer.swift     cashew VolumeStorer adapter
   BrokerErrors.swift     Shared error types
 ```
 
@@ -100,8 +100,10 @@ let evicted = try await disk.evictUnpinned()
 ```swift
 // Storing a Merkle tree
 let storer = BrokerStorer(broker: disk)
-try root.storeRecursively(storer: storer)
-try await storer.flush(root: root.rawCID)  // commits all buffered SerializedVolumes
+try await root.storeRecursively(storer: storer)
+
+// Or store the root plus selected nested Volumes
+try await root.store(paths: [["accounts/alice"]: .targeted], storer: storer)
 
 // Resolving a Merkle tree
 let fetcher = BrokerFetcher(broker: memory)  // ContentSource/Fetcher; uses fetch cascade
@@ -115,7 +117,7 @@ SQLite tables with WAL journaling:
 | Table | Purpose |
 |---|---|
 | `cas_data(cid, data)` | Content-addressed blob store; shared across Volumes |
-| `volume_entries(root, cid)` | Owned-child reachability graph: which CIDs belong to / are bracketed under which Volume |
+| `volume_entries(root, cid)` | Membership index: which CIDs are stored inside each complete Volume |
 | `volume_pins(root, owner, count, expires_at)` | Ref-counted pin ledger with optional TTL; `count INTEGER NOT NULL DEFAULT 1` |
 | `volume_unpin_operations(operation_id)` | Idempotency ledger for `unpinBatchOnce` |
 | `volume_metadata(root, stored_at)` | Volume lifecycle tracking (drives the eviction grace window) |

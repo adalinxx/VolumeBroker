@@ -202,14 +202,8 @@ struct EvictionEngineTests {
                 "after eviction, the prior absent bloom verdict is authoritative again")
     }
 
-    /// Collect the independent Volumes a `BrokerStorer` produces, exactly as
-    /// cashew's `storeRecursively` drives it (enter/store/exit per boundary).
-    private func storeReal(_ h: Harness, build: (BrokerStorer) throws -> Void, root: String) async throws {
-        let storer = BrokerStorer(broker: MemoryBroker())
-        try build(storer)
-        for vol in storer.collectVolumes(root: root) {
-            try await h.store.storeVolumeLocal(vol)
-        }
+    private func storeVolumes(_ h: Harness, _ volumes: [SerializedVolume]) async throws {
+        try await h.store.storeVolumesLocal(volumes)
     }
 
     @Test func pinnedRootDoesNotProtectAnotherVolume() async throws {
@@ -217,15 +211,13 @@ struct EvictionEngineTests {
         let obj = cid("obj")
         let nested = cid("nested")
         let deep = cid("deep")
-        try await storeReal(h, build: { s in
-            try s.enterVolume(rootCID: obj)
-            try s.store(rawCid: obj, data: Data("obj".utf8))
-            try s.exitVolume(rootCID: obj)
-            try s.enterVolume(rootCID: nested)
-            try s.store(rawCid: nested, data: Data("nested".utf8))
-            try s.store(rawCid: deep, data: Data("deep".utf8))
-            try s.exitVolume(rootCID: nested)
-        }, root: obj)
+        try await storeVolumes(h, [
+            SerializedVolume(root: obj, entries: [obj: Data("obj".utf8)]),
+            SerializedVolume(
+                root: nested,
+                entries: [nested: Data("nested".utf8), deep: Data("deep".utf8)]
+            ),
+        ])
         try await h.pins.pin(root: obj, owner: "o", count: 1, ttl: nil)
 
         let evicted = try await h.eviction.evictUnpinned(graceSeconds: 0)
@@ -240,15 +232,13 @@ struct EvictionEngineTests {
         let obj = cid("obj")
         let nested = cid("nested")
         let deep = cid("deep")
-        try await storeReal(h, build: { s in
-            try s.enterVolume(rootCID: obj)
-            try s.store(rawCid: obj, data: Data("obj".utf8))
-            try s.exitVolume(rootCID: obj)
-            try s.enterVolume(rootCID: nested)
-            try s.store(rawCid: nested, data: Data("nested".utf8))
-            try s.store(rawCid: deep, data: Data("deep".utf8))
-            try s.exitVolume(rootCID: nested)
-        }, root: obj)
+        try await storeVolumes(h, [
+            SerializedVolume(root: obj, entries: [obj: Data("obj".utf8)]),
+            SerializedVolume(
+                root: nested,
+                entries: [nested: Data("nested".utf8), deep: Data("deep".utf8)]
+            ),
+        ])
         try await h.pins.pin(root: obj, owner: "o", count: 1, ttl: nil)
         try await h.pins.pin(root: nested, owner: "o", count: 1, ttl: nil)
 
@@ -266,18 +256,14 @@ struct EvictionEngineTests {
         let txDict = cid("txDict")
         let txBody = cid("txBody")
         let postState = cid("postState")
-        try await storeReal(h, build: { s in
-            try s.enterVolume(rootCID: block)
-            try s.store(rawCid: block, data: Data("block".utf8))
-            try s.store(rawCid: txDict, data: Data("txDict".utf8))
-            try s.exitVolume(rootCID: block)
-            try s.enterVolume(rootCID: txBody)
-            try s.store(rawCid: txBody, data: Data("txBody".utf8))
-            try s.exitVolume(rootCID: txBody)
-            try s.enterVolume(rootCID: postState)
-            try s.store(rawCid: postState, data: Data("postState".utf8))
-            try s.exitVolume(rootCID: postState)
-        }, root: block)
+        try await storeVolumes(h, [
+            SerializedVolume(
+                root: block,
+                entries: [block: Data("block".utf8), txDict: Data("txDict".utf8)]
+            ),
+            SerializedVolume(root: txBody, entries: [txBody: Data("txBody".utf8)]),
+            SerializedVolume(root: postState, entries: [postState: Data("postState".utf8)]),
+        ])
         try await h.pins.pin(root: block, owner: "h:1", count: 1, ttl: nil)
 
         let evicted = try await h.eviction.evictUnpinned(graceSeconds: 0)

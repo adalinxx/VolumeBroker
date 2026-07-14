@@ -43,6 +43,28 @@ struct ContentStoreTests {
         }
     }
 
+    private struct ObjectWithTwoVolumes: Node, Sendable {
+        let selected: VolumeImpl<Leaf>
+        let sibling: VolumeImpl<Leaf>
+
+        func get(property: PathSegment) -> (any Header)? {
+            switch property {
+            case "selected": selected
+            case "sibling": sibling
+            default: nil
+            }
+        }
+
+        func properties() -> Set<PathSegment> { ["selected", "sibling"] }
+
+        func set(properties: [PathSegment: any Header]) -> Self {
+            Self(
+                selected: properties["selected"] as? VolumeImpl<Leaf> ?? selected,
+                sibling: properties["sibling"] as? VolumeImpl<Leaf> ?? sibling
+            )
+        }
+    }
+
     @Test func putThenGetRoundTrips() async throws {
         let store = ContentStore(broker: MemoryBroker())
         let dict = try Dict()
@@ -84,5 +106,22 @@ struct ContentStoreTests {
 
         #expect(await broker.hasVolume(root: expectedRoot))
         #expect(await broker.hasVolume(root: failingChild.rawCID) == false)
+    }
+
+    @Test func targetedPutStoresOnlySelectedNestedVolumes() async throws {
+        let selected = try VolumeImpl(node: Leaf(value: "selected"))
+        let sibling = try VolumeImpl(node: Leaf(value: "sibling"))
+        let object = ObjectWithTwoVolumes(selected: selected, sibling: sibling)
+        let broker = MemoryBroker()
+        let store = ContentStore(broker: broker)
+
+        let root = try await store.put(
+            object,
+            storing: [["selected"]: StorageStrategy.targeted]
+        )
+
+        #expect(await broker.hasVolume(root: root))
+        #expect(await broker.hasVolume(root: selected.rawCID))
+        #expect(await broker.hasVolume(root: sibling.rawCID) == false)
     }
 }

@@ -143,29 +143,4 @@ final class VolumeIntegrityTests: XCTestCase {
         XCTAssertNil(fetched)
     }
 
-    func testAbortedScopeCannotBeCollectedAsACompleteVolume() throws {
-        let storer = BrokerStorer(broker: MemoryBroker())
-        try storer.enterVolume(rootCID: "outer")
-        try storer.store(rawCid: "outer", data: Data("partial".utf8))
-
-        XCTAssertTrue(storer.collectVolumes(root: "outer").isEmpty)
-        XCTAssertEqual(storer.openVolumeRoots, ["outer"])
-
-        storer.abortVolume(rootCID: "outer")
-        XCTAssertTrue(storer.openVolumeRoots.isEmpty)
-        XCTAssertTrue(try storer.collectCompleteVolumes(root: "outer").isEmpty)
-    }
-
-    func testUnbalancedExitFailsClosed() throws {
-        let storer = BrokerStorer(broker: MemoryBroker())
-        try storer.enterVolume(rootCID: "outer")
-
-        XCTAssertThrowsError(try storer.exitVolume(rootCID: "other")) { error in
-            XCTAssertEqual(
-                error as? BrokerError,
-                .unbalancedVolumeScope(expected: "outer", actual: "other")
-            )
-        }
-        XCTAssertEqual(storer.openVolumeRoots, ["outer"])
-    }
 }

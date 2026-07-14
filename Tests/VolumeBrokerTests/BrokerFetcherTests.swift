@@ -24,10 +24,7 @@ struct BrokerFetcherTests {
             .inserting(key: "bob", value: "v3")
         let original = try TestVolume(node: dictionary)
 
-        try original.storeRecursively(storer: storer)
-        try await storer.flush(root: original.rawCID)
-
-        #expect(storer.storedRoots.count >= 2)
+        try await original.storeRecursively(storer: storer)
 
         let source = BrokerFetcher(broker: broker)
         let lazyRoot = TestVolume(rawCID: original.rawCID, node: nil, encryptionInfo: nil)
@@ -43,8 +40,8 @@ struct BrokerFetcherTests {
         let storer = BrokerStorer(broker: broker)
         let a = try TestVolume(node: TestDictionary().inserting(key: "k", value: "va"))
         let b = try TestVolume(node: TestDictionary().inserting(key: "k", value: "vb"))
-        try a.storeRecursively(storer: storer); try await storer.flush(root: a.rawCID)
-        try b.storeRecursively(storer: storer); try await storer.flush(root: b.rawCID)
+        try await a.storeRecursively(storer: storer)
+        try await b.storeRecursively(storer: storer)
 
         let source = BrokerFetcher(broker: broker)
         let got = await source.fetch([a.rawCID, b.rawCID, "missing"])
@@ -56,18 +53,17 @@ struct BrokerFetcherTests {
     @Test func fetchesInternalEntryByCidWithoutEnteringVolume() async throws {
         // Object-grain storage: one Volume holds multiple entries; the
         // internal entry is NOT its own volume root. With the cas_data CID-blob
-        // primitive it resolves directly by CID — no enterVolume needed.
+        // primitive it resolves directly by CID.
         let broker = MemoryBroker()
         let storer = BrokerStorer(broker: broker)
         let rootData = Data("root".utf8)
         let internalData = Data("internal-data".utf8)
         let root = cid(for: rootData)
         let internalCID = cid(for: internalData)
-        try storer.enterVolume(rootCID: root)
-        try storer.store(rawCid: root, data: rootData)
-        try storer.store(rawCid: internalCID, data: internalData)
-        try storer.exitVolume(rootCID: root)
-        try await storer.flush(root: root)
+        try await storer.store(volume: SerializedVolume(
+            root: root,
+            entries: [root: rootData, internalCID: internalData]
+        ))
 
         // No Volume is keyed by the internal CID; it is only an entry under root.
         #expect(await broker.fetchVolumeLocal(root: internalCID) == nil)

@@ -4,9 +4,8 @@ import cashew
 /// Bridges a `VolumeBroker` tier chain to cashew resolution as a batched
 /// `ContentSource` (and a per-CID `Fetcher` for legacy callers).
 ///
-/// cashew 3.0.0 resolves over a batched `ContentSource`; the former
-/// `VolumeAwareFetcher` `enterVolume` bulk-prefetch + active-entry bookkeeping
-/// is gone — `CoalescingFetcher` now batches each resolution wave, so this just
+/// cashew 3.0.0 resolves over a batched `ContentSource`.
+/// `CoalescingFetcher` batches each resolution wave, so this adapter
 /// answers content lookups against the broker chain via `fetchData(cid:)`
 /// (resolves any node by CID, not only volume roots).
 public actor BrokerFetcher: ContentSource, Fetcher {

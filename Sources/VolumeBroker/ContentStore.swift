@@ -39,21 +39,33 @@ public actor ContentStore {
 
     // MARK: - Write
 
-    /// Store a whole object (recursively grouping it into volumes via the
-    /// store-side `VolumeAwareStorer`); returns its root CID.
+    /// Store a whole object and every materialized nested Volume.
     @discardableResult
     public func put<T: Node>(_ object: T) async throws -> String {
         let header = try VolumeImpl(node: object)
-        let storer = BrokerStorer(broker: broker)
-        do {
-            try header.storeRecursively(storer: storer)
-        } catch let traversalError {
-            // A nested Volume may fail after earlier independent scopes completed.
-            // Persist those scopes before reporting the nested failure.
-            try await storer.flush(root: header.rawCID)
-            throw traversalError
-        }
-        try await storer.flush(root: header.rawCID)
+        try await header.storeRecursively(storer: BrokerStorer(broker: broker))
+        return header.rawCID
+    }
+
+    /// Store a whole object and only the nested Volumes selected by `paths`.
+    @discardableResult
+    public func put<T: Node>(
+        _ object: T,
+        storing paths: ArrayTrie<StorageStrategy>
+    ) async throws -> String {
+        let header = try VolumeImpl(node: object)
+        try await header.store(paths: paths, storer: BrokerStorer(broker: broker))
+        return header.rawCID
+    }
+
+    /// Dictionary convenience matching Cashew's path-based storage API.
+    @discardableResult
+    public func put<T: Node>(
+        _ object: T,
+        storing paths: [[String]: StorageStrategy]
+    ) async throws -> String {
+        let header = try VolumeImpl(node: object)
+        try await header.store(paths: paths, storer: BrokerStorer(broker: broker))
         return header.rawCID
     }
 
