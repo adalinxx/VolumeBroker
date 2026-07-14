@@ -77,7 +77,8 @@ public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRoot
     public func storeVolumeLocal(_ volume: SerializedVolume) async throws {
         try volume.validate()
         let insertedAt = ContinuousClock.Instant.now
-        lock.withWriteLock {
+        try lock.withWriteLock {
+            try Self.validateMemberships([volume], against: state.volumes)
             let isNewRoot = state.volumes[volume.root] == nil
             state.volumes[volume.root] = volume
             if isNewRoot { state.insertedAt[volume.root] = insertedAt }
@@ -90,7 +91,8 @@ public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRoot
     public func storeVolumesLocal(_ volumes: [SerializedVolume]) async throws {
         for volume in volumes { try volume.validate() }
         let insertedAt = ContinuousClock.Instant.now
-        lock.withWriteLock {
+        try lock.withWriteLock {
+            try Self.validateMemberships(volumes, against: state.volumes)
             for volume in volumes {
                 let isNewRoot = state.volumes[volume.root] == nil
                 state.volumes[volume.root] = volume
@@ -100,6 +102,23 @@ public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRoot
         }
         evictIfOverCapacity()
         evictIfOverByteBudget()
+    }
+
+    private static func validateMemberships(
+        _ volumes: [SerializedVolume],
+        against stored: [String: SerializedVolume]
+    ) throws {
+        var pending: [String: Set<String>] = [:]
+        for volume in volumes {
+            let entries = Set(volume.entries.keys)
+            let existing = pending[volume.root]
+                ?? stored[volume.root].map { Set($0.entries.keys) }
+                ?? entries
+            if existing != entries {
+                throw BrokerError.conflictingVolume(volume.root)
+            }
+            pending[volume.root] = entries
+        }
     }
 
     public func pin(root: String, owner: String, count: Int, ttl: Duration?) async throws {

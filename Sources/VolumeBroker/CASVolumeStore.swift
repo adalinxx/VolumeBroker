@@ -125,10 +125,38 @@ struct CASVolumeStore {
     // MARK: - Row helpers (write connection; call inside a transaction)
 
     private func store(_ volume: SerializedVolume) throws {
+        try validateExistingMembership(of: volume)
         try upsertMetadata(root: volume.root)
         for (cid, data) in volume.entries {
             try upsertCASData(cid: cid, data: data)
             try insertVolumeEntry(root: volume.root, cid: cid)
+        }
+    }
+
+    private func validateExistingMembership(of volume: SerializedVolume) throws {
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(connection.db, "SELECT cid FROM volume_entries WHERE root = ?1", -1, &stmt, nil) == SQLITE_OK,
+              let stmt else {
+            throw BrokerError.sqlFailed("prepare existing Volume lookup")
+        }
+        sqlite3_bind_text(stmt, 1, volume.root, -1, SQLITE_TRANSIENT_SHIM)
+
+        var existing = Set<String>()
+        while true {
+            let result = sqlite3_step(stmt)
+            if result == SQLITE_DONE { break }
+            guard result == SQLITE_ROW else {
+                throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
+            }
+            guard let cid = sqlite3_column_text(stmt, 0) else {
+                throw BrokerError.sqlFailed("read existing Volume membership")
+            }
+            existing.insert(String(cString: cid))
+        }
+
+        if !existing.isEmpty, existing != Set(volume.entries.keys) {
+            throw BrokerError.conflictingVolume(volume.root)
         }
     }
 

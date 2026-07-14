@@ -16,16 +16,16 @@ All Volumes are validated before a MemoryBroker mutation or SQLite transaction b
 
 An existing CID row must be byte-identical. Conflicting bytes are surfaced as corruption rather than hidden by `INSERT OR IGNORE`.
 
-## VOLUME-005 — incomplete traversal is not publishable
+## VOLUME-005 — published Volume membership is immutable
 
-An open or aborted Volume scope cannot be collected or flushed as complete, exits must match stack order, and an exit without the declared root entry fails closed.
+Re-storing a Volume root must provide the same complete entry set. MemoryBroker and DiskBroker reject conflicting memberships before mutating storage.
 
 ## VOLUME-006 — legacy partial rows are unavailable
 
 Presence and fetch checks reject a stored root when its root entry or any recorded CAS entry is missing.
 
-## VOLUME-007 — failed flushes are retryable
+## VOLUME-007 — incomplete traversal is not publishable
 
-Completed in-memory Volumes are cleared only after the broker accepts the whole flush.
+Cashew fully serializes a selected Volume boundary before invoking `VolumeStorer`. A missing or unserializable ordinary Header prevents that Volume from reaching the broker.
 
-Established by: `VolumeIntegrityTests` and the companion cashew lifecycle tests.
+Established by: `VolumeIntegrityTests` and the companion cashew storage-plan tests.

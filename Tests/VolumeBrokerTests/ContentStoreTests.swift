@@ -85,7 +85,7 @@ struct ContentStoreTests {
         #expect(await store.has("nonexistent") == false)
     }
 
-    @Test func completedParentIsFlushedBeforeNestedFailureReturns() async throws {
+    @Test func completedParentIsStoredBeforeNestedFailureReturns() async throws {
         let placeholder = try VolumeImpl(node: Leaf(value: "placeholder"))
         let failingChild = VolumeImpl<FailingLeaf>(
             rawCID: placeholder.rawCID,

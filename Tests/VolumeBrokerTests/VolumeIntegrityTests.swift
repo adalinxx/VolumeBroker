@@ -98,6 +98,57 @@ final class VolumeIntegrityTests: XCTestCase {
         XCTAssertFalse(validPresent)
     }
 
+    func testBrokersRejectConflictingVolumeMembershipWithoutMutation() async throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VolumeIntegrityTests-\(UUID().uuidString).sqlite").path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let brokers: [any VolumeBroker] = [MemoryBroker(), try DiskBroker(path: path)]
+        let rootData = Data("root".utf8)
+        let firstChildData = Data("first".utf8)
+        let secondChildData = Data("second".utf8)
+        let root = try cid(for: rootData)
+        let firstChild = try cid(for: firstChildData)
+        let secondChild = try cid(for: secondChildData)
+        let first = SerializedVolume(root: root, entries: [root: rootData, firstChild: firstChildData])
+        let conflicting = SerializedVolume(root: root, entries: [root: rootData, secondChild: secondChildData])
+
+        for broker in brokers {
+            try await broker.storeVolumeLocal(first)
+            do {
+                try await broker.storeVolumeLocal(conflicting)
+                XCTFail("a published Volume membership must be immutable")
+            } catch {
+                XCTAssertEqual(error as? BrokerError, .conflictingVolume(root))
+            }
+            let fetched = await broker.fetchVolumeLocal(root: root)
+            XCTAssertEqual(Set(fetched?.entries.keys.map { $0 } ?? []), [root, firstChild])
+        }
+    }
+
+    func testConflictingVolumeMembershipAbortsWholeBatch() async throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VolumeIntegrityTests-\(UUID().uuidString).sqlite").path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let brokers: [any VolumeBroker] = [MemoryBroker(), try DiskBroker(path: path)]
+        let rootData = Data("root".utf8)
+        let childData = Data("child".utf8)
+        let root = try cid(for: rootData)
+        let child = try cid(for: childData)
+        let first = SerializedVolume(root: root, entries: [root: rootData])
+        let conflicting = SerializedVolume(root: root, entries: [root: rootData, child: childData])
+
+        for broker in brokers {
+            do {
+                try await broker.storeVolumesLocal([first, conflicting])
+                XCTFail("conflicting batch must fail")
+            } catch {
+                XCTAssertEqual(error as? BrokerError, .conflictingVolume(root))
+            }
+            let present = await broker.hasVolume(root: root)
+            XCTAssertFalse(present)
+        }
+    }
+
     func testMissingCASDataMakesLegacyVolumeUnavailable() async throws {
         let path = FileManager.default.temporaryDirectory
             .appendingPathComponent("VolumeIntegrityTests-\(UUID().uuidString).sqlite").path
@@ -142,5 +193,4 @@ final class VolumeIntegrityTests: XCTestCase {
         XCTAssertFalse(present)
         XCTAssertNil(fetched)
     }
-
 }
