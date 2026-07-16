@@ -4,8 +4,12 @@ import XCTest
 @testable import VolumeBroker
 
 final class VolumeIntegrityTests: XCTestCase {
-    private func cid(for data: Data) throws -> String {
-        let multihash = try Multihash(raw: data, hashedWith: .sha2_256)
+    private func cid(for data: Data, digestLength: Int? = nil) throws -> String {
+        let multihash = try Multihash(
+            raw: data,
+            hashedWith: .sha2_256,
+            customByteLength: digestLength
+        )
         return try CID(version: .v1, codec: .dag_cbor, multihash: multihash).toBaseEncodedString
     }
 
@@ -39,6 +43,67 @@ final class VolumeIntegrityTests: XCTestCase {
 
         XCTAssertThrowsError(try volume.validate()) { error in
             XCTAssertEqual(error as? SerializedVolumeError, .contentAddressMismatch(root))
+        }
+    }
+
+    func testValidTruncatedSHAHashUsesDeclaredDigestLength() throws {
+        let data = Data("truncated".utf8)
+        let root = try cid(for: data, digestLength: 16)
+
+        XCTAssertNoThrow(try SerializedVolume(root: root, entries: [root: data]).validate())
+    }
+
+    func testCIDv0RequiresDagPBSHA256WithFullDigest() throws {
+        let data = Data("v0".utf8)
+        let valid = try Multihash(raw: data, hashedWith: .sha2_256)
+            .asString(base: .base58btc)
+        let truncated = try Multihash(
+            raw: data,
+            hashedWith: .sha2_256,
+            customByteLength: 15
+        ).asString(base: .base58btc)
+        let identity = try Multihash(raw: data, hashedWith: .identity)
+            .asString(base: .base58btc)
+
+        XCTAssertNoThrow(try SerializedVolume(root: valid, entries: [valid: data]).validate())
+        let prefixedAlias = "z\(valid)"
+        XCTAssertThrowsError(
+            try SerializedVolume(root: prefixedAlias, entries: [prefixedAlias: data]).validate()
+        )
+        XCTAssertThrowsError(try SerializedVolume(root: truncated, entries: [truncated: data]).validate())
+        XCTAssertThrowsError(try SerializedVolume(root: identity, entries: [identity: data]).validate())
+    }
+
+    func testTruncatedSHAHashStillRejectsWrongContent() throws {
+        let expected = Data("expected".utf8)
+        let root = try cid(for: expected, digestLength: 16)
+
+        XCTAssertThrowsError(
+            try SerializedVolume(root: root, entries: [root: Data("wrong".utf8)]).validate()
+        ) { error in
+            XCTAssertEqual(error as? SerializedVolumeError, .contentAddressMismatch(root))
+        }
+    }
+
+    func testIdentityHashRequiresExactPayloadRatherThanPrefix() throws {
+        let digest = Data("identity".utf8)
+        let multihash = try Multihash(raw: digest, hashedWith: .identity)
+        let root = try CID(version: .v1, codec: .dag_cbor, multihash: multihash).toBaseEncodedString
+
+        XCTAssertNoThrow(try SerializedVolume(root: root, entries: [root: digest]).validate())
+        XCTAssertThrowsError(
+            try SerializedVolume(root: root, entries: [root: digest + Data("-suffix".utf8)]).validate()
+        ) { error in
+            XCTAssertEqual(error as? SerializedVolumeError, .contentAddressMismatch(root))
+        }
+    }
+
+    func testZeroLengthDigestFailsClosed() throws {
+        let data = Data("zero".utf8)
+        let root = try cid(for: data, digestLength: 0)
+
+        XCTAssertThrowsError(try SerializedVolume(root: root, entries: [root: data]).validate()) { error in
+            XCTAssertEqual(error as? SerializedVolumeError, .invalidCID(root))
         }
     }
 
@@ -79,8 +144,11 @@ final class VolumeIntegrityTests: XCTestCase {
         XCTAssertFalse(present)
     }
 
-    func testMemoryBatchValidationIsAtomic() async throws {
-        let broker = MemoryBroker()
+    func testMalformedBatchValidationIsAtomicInMemoryAndDisk() async throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VolumeIntegrityTests-\(UUID().uuidString).sqlite").path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let brokers: [any VolumeBroker] = [MemoryBroker(), try DiskBroker(path: path)]
         let validData = Data("valid".utf8)
         let validRoot = try cid(for: validData)
         let valid = SerializedVolume(root: validRoot, entries: [validRoot: validData])
@@ -88,14 +156,16 @@ final class VolumeIntegrityTests: XCTestCase {
         let invalidRoot = try cid(for: invalidData)
         let invalid = SerializedVolume(root: invalidRoot, entries: [invalidRoot: Data("wrong".utf8)])
 
-        do {
-            try await broker.storeVolumesLocal([valid, invalid])
-            XCTFail("a malformed Volume must reject the whole batch")
-        } catch {
-            XCTAssertEqual(error as? SerializedVolumeError, .contentAddressMismatch(invalidRoot))
+        for broker in brokers {
+            do {
+                try await broker.storeVolumesLocal([valid, invalid])
+                XCTFail("a malformed Volume must reject the whole batch")
+            } catch {
+                XCTAssertEqual(error as? SerializedVolumeError, .contentAddressMismatch(invalidRoot))
+            }
+            let validPresent = await broker.hasVolume(root: validRoot)
+            XCTAssertFalse(validPresent)
         }
-        let validPresent = await broker.hasVolume(root: validRoot)
-        XCTAssertFalse(validPresent)
     }
 
     func testBrokersRejectConflictingVolumeMembershipWithoutMutation() async throws {
@@ -149,12 +219,45 @@ final class VolumeIntegrityTests: XCTestCase {
         }
     }
 
-    func testMissingCASDataMakesLegacyVolumeUnavailable() async throws {
+    func testExistingConflictRollsBackEarlierNewVolumeInBatch() async throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VolumeIntegrityTests-\(UUID().uuidString).sqlite").path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let brokers: [any VolumeBroker] = [MemoryBroker(), try DiskBroker(path: path)]
+        let existingData = Data("existing".utf8)
+        let addedData = Data("added".utf8)
+        let newData = Data("new".utf8)
+        let existingRoot = try cid(for: existingData)
+        let added = try cid(for: addedData)
+        let newRoot = try cid(for: newData)
+        let existing = SerializedVolume(root: existingRoot, entries: [existingRoot: existingData])
+        let conflicting = SerializedVolume(
+            root: existingRoot,
+            entries: [existingRoot: existingData, added: addedData]
+        )
+        let newVolume = SerializedVolume(root: newRoot, entries: [newRoot: newData])
+
+        for broker in brokers {
+            try await broker.storeVolumeLocal(existing)
+            do {
+                try await broker.storeVolumesLocal([newVolume, conflicting])
+                XCTFail("existing conflict must roll back the whole batch")
+            } catch {
+                XCTAssertEqual(error as? BrokerError, .conflictingVolume(existingRoot))
+            }
+            let newPresent = await broker.hasVolume(root: newRoot)
+            let existingEntries = await broker.fetchVolumeLocal(root: existingRoot)?.entries
+            XCTAssertFalse(newPresent)
+            XCTAssertEqual(existingEntries, existing.entries)
+        }
+    }
+
+    func testMissingCASDataMakesManifestUnavailable() async throws {
         let path = FileManager.default.temporaryDirectory
             .appendingPathComponent("VolumeIntegrityTests-\(UUID().uuidString).sqlite").path
         defer { try? FileManager.default.removeItem(atPath: path) }
         let connection = try SQLiteConnection(path: path)
-        let store = CASVolumeStore(connection: connection, negativeCache: NegativeCache())
+        let store = CASVolumeStore(connection: connection)
         let rootData = Data("root".utf8)
         let childData = Data("child".utf8)
         let root = try cid(for: rootData)
@@ -165,32 +268,108 @@ final class VolumeIntegrityTests: XCTestCase {
         ))
 
         try await connection.write {
-            try connection.exec("DELETE FROM cas_data WHERE cid='\(child)'")
+            try connection.exec("PRAGMA foreign_keys=OFF")
+            do {
+                try connection.exec("DELETE FROM cas_data WHERE cid='\(child)'")
+                try connection.exec("PRAGMA foreign_keys=ON")
+            } catch {
+                try? connection.exec("PRAGMA foreign_keys=ON")
+                throw error
+            }
         }
 
         let present = await store.hasVolume(root: root)
         let fetched = await store.fetchVolumeLocal(root: root)
         XCTAssertFalse(present)
         XCTAssertNil(fetched)
+        let rootBytes = await store.fetchDataLocal(cid: root)
+        let childBytes = await store.fetchDataLocal(cid: child)
+        XCTAssertNil(rootBytes)
+        XCTAssertNil(childBytes)
     }
 
-    func testMissingPublicationMetadataMakesLegacyVolumeUnavailable() async throws {
+    func testMissingManifestMembershipFailsAllReadsClosed() async throws {
         let path = FileManager.default.temporaryDirectory
             .appendingPathComponent("VolumeIntegrityTests-\(UUID().uuidString).sqlite").path
         defer { try? FileManager.default.removeItem(atPath: path) }
         let connection = try SQLiteConnection(path: path)
-        let store = CASVolumeStore(connection: connection, negativeCache: NegativeCache())
+        let store = CASVolumeStore(connection: connection)
         let rootData = Data("root".utf8)
+        let childData = Data("child".utf8)
         let root = try cid(for: rootData)
-        try await store.storeVolumeLocal(SerializedVolume(root: root, entries: [root: rootData]))
+        let child = try cid(for: childData)
+        try await store.storeVolumeLocal(SerializedVolume(
+            root: root,
+            entries: [root: rootData, child: childData]
+        ))
 
         try await connection.write {
-            try connection.exec("DELETE FROM volume_metadata WHERE root='\(root)'")
+            try connection.exec("DELETE FROM volume_entries WHERE root='\(root)' AND cid='\(child)'")
         }
 
         let present = await store.hasVolume(root: root)
         let fetched = await store.fetchVolumeLocal(root: root)
         XCTAssertFalse(present)
         XCTAssertNil(fetched)
+        let rootBytes = await store.fetchDataLocal(cid: root)
+        let childBytes = await store.fetchDataLocal(cid: child)
+        XCTAssertNil(rootBytes)
+        XCTAssertNil(childBytes)
+    }
+
+    func testCorruptedCASBytesFailAllReadsClosed() async throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VolumeIntegrityTests-\(UUID().uuidString).sqlite").path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let connection = try SQLiteConnection(path: path)
+        let store = CASVolumeStore(connection: connection)
+        let rootData = Data("root".utf8)
+        let childData = Data("child".utf8)
+        let root = try cid(for: rootData)
+        let child = try cid(for: childData)
+        try await store.storeVolumeLocal(SerializedVolume(
+            root: root,
+            entries: [root: rootData, child: childData]
+        ))
+
+        try await connection.write {
+            try connection.exec("UPDATE cas_data SET data=X'00' WHERE cid='\(child)'")
+        }
+
+        let present = await store.hasVolume(root: root)
+        let volume = await store.fetchVolumeLocal(root: root)
+        let rootBytes = await store.fetchDataLocal(cid: root)
+        let childBytes = await store.fetchDataLocal(cid: child)
+        XCTAssertFalse(present)
+        XCTAssertNil(volume)
+        XCTAssertNil(rootBytes)
+        XCTAssertNil(childBytes)
+    }
+
+    func testOwnedCIDIsReadableButLooseCASRowIsInvisible() async throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VolumeIntegrityTests-\(UUID().uuidString).sqlite").path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let connection = try SQLiteConnection(path: path)
+        let store = CASVolumeStore(connection: connection)
+        let rootData = Data("root".utf8)
+        let childData = Data("child".utf8)
+        let orphanData = Data("orphan".utf8)
+        let root = try cid(for: rootData)
+        let child = try cid(for: childData)
+        let orphan = try cid(for: orphanData)
+        try await store.storeVolumeLocal(SerializedVolume(
+            root: root,
+            entries: [root: rootData, child: childData]
+        ))
+        let orphanHex = orphanData.map { String(format: "%02x", $0) }.joined()
+        try await connection.write {
+            try connection.exec("INSERT INTO cas_data(cid, data) VALUES('\(orphan)', X'\(orphanHex)')")
+        }
+
+        let ownedBytes = await store.fetchDataLocal(cid: child)
+        let orphanBytes = await store.fetchDataLocal(cid: orphan)
+        XCTAssertEqual(ownedBytes, childData)
+        XCTAssertNil(orphanBytes)
     }
 }

@@ -362,9 +362,11 @@ struct DiskBrokerTests {
 
     @Test func unpinMoreThanCountRemovesPin() async throws {
         let broker = try tempDB()
-        try await broker.pin(root: "r1", owner: "chain-a", count: 2)
-        try await broker.unpin(root: "r1", owner: "chain-a", count: 5)
-        #expect(await broker.owners(root: "r1").isEmpty)
+        let root = cid("r1")
+        try await broker.storeVolumeLocal(payload("r1"))
+        try await broker.pin(root: root, owner: "chain-a", count: 2)
+        try await broker.unpin(root: root, owner: "chain-a", count: 5)
+        #expect(await broker.owners(root: root).isEmpty)
     }
 
     @Test func ttlExpiredOwnerPrunedOnEvict() async throws {
@@ -393,19 +395,21 @@ struct DiskBrokerTests {
 
     @Test func pinnedRootsByOwnerAndPrefix() async throws {
         let broker = try tempDB()
-        try await broker.pin(root: "exact-root", owner: "account:Nexus/A/Child")
-        try await broker.pin(root: "height-root", owner: "Nexus/A/Child:42")
-        try await broker.pin(root: "candidate-root", owner: "candidate:Nexus/A/Child:43")
-        try await broker.pin(root: "expired-root", owner: "Nexus/A/Child:44", ttl: .zero)
-        try await broker.pin(root: "foreign-root", owner: "Nexus/B/Child:42")
-        try await broker.pin(root: "leaf-root", owner: "Child:42")
+        let labels = ["exact-root", "height-root", "candidate-root", "expired-root", "foreign-root", "leaf-root"]
+        try await broker.storeVolumesLocal(labels.map { payload($0) })
+        try await broker.pin(root: cid("exact-root"), owner: "account:Nexus/A/Child")
+        try await broker.pin(root: cid("height-root"), owner: "Nexus/A/Child:42")
+        try await broker.pin(root: cid("candidate-root"), owner: "candidate:Nexus/A/Child:43")
+        try await broker.pin(root: cid("expired-root"), owner: "Nexus/A/Child:44", ttl: .zero)
+        try await broker.pin(root: cid("foreign-root"), owner: "Nexus/B/Child:42")
+        try await broker.pin(root: cid("leaf-root"), owner: "Child:42")
 
         let roots = Set(await broker.pinnedRoots(
             owners: ["account:Nexus/A/Child"],
             ownerPrefixes: ["Nexus/A/Child:", "candidate:Nexus/A/Child:"]
         ))
 
-        #expect(roots == ["exact-root", "height-root", "candidate-root"])
+        #expect(roots == [cid("exact-root"), cid("height-root"), cid("candidate-root")])
     }
 
     /// Regression: DiskBroker is shared across multiple ChainNetwork actors.

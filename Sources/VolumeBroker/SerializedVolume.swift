@@ -24,13 +24,36 @@ public extension SerializedVolume {
 
         for (rawCID, data) in entries {
             let expected = try parsedCID(rawCID)
-            guard let algorithm = expected.multihash.algorithm else {
+            guard let algorithm = expected.multihash.algorithm,
+                  let digestLength = expected.multihash.length,
+                  let expectedDigest = expected.multihash.digest,
+                  digestLength > 0 else {
                 throw SerializedVolumeError.invalidCID(rawCID)
+            }
+            if expected.version == .v0 {
+                guard expected.codec == .dag_pb,
+                      algorithm == .sha2_256,
+                      digestLength == 32,
+                      expected.toBaseEncodedString == rawCID else {
+                    throw SerializedVolumeError.invalidCID(rawCID)
+                }
+            }
+
+            if algorithm == .identity {
+                guard expectedDigest.count == digestLength,
+                      Data(expectedDigest) == data else {
+                    throw SerializedVolumeError.contentAddressMismatch(rawCID)
+                }
+                continue
             }
 
             let actualMultihash: Multihash
             do {
-                actualMultihash = try Multihash(raw: data, hashedWith: algorithm)
+                actualMultihash = try Multihash(
+                    raw: data,
+                    hashedWith: algorithm,
+                    customByteLength: digestLength
+                )
             } catch {
                 throw SerializedVolumeError.invalidCID(rawCID)
             }
@@ -58,5 +81,13 @@ public extension SerializedVolume {
         } catch {
             throw SerializedVolumeError.invalidCID(rawCID)
         }
+    }
+}
+
+extension SerializedVolume {
+    func ownedCopy() -> SerializedVolume {
+        SerializedVolume(root: root, entries: entries.mapValues { data in
+            data.withUnsafeBytes { Data($0) }
+        })
     }
 }

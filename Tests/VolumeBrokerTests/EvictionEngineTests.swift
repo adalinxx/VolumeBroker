@@ -2,6 +2,11 @@ import Testing
 import Foundation
 import CID
 import Multihash
+#if canImport(SQLite3)
+import SQLite3
+#else
+import VolumeBrokerSQLite
+#endif
 @testable import VolumeBroker
 
 /// Independent unit tests for the `EvictionEngine` collaborator.
@@ -15,21 +20,20 @@ import Multihash
 struct EvictionEngineTests {
 
     private struct Harness {
+        let connection: SQLiteConnection
         let store: CASVolumeStore
         let pins: PinIndex
         let eviction: EvictionEngine
-        let negativeCache: NegativeCache
     }
 
     private func harness() throws -> Harness {
         let path = NSTemporaryDirectory() + "vb_eviction_\(UUID().uuidString).sqlite"
         let connection = try SQLiteConnection(path: path)
-        let negativeCache = NegativeCache()
         return Harness(
-            store: CASVolumeStore(connection: connection, negativeCache: negativeCache),
+            connection: connection,
+            store: CASVolumeStore(connection: connection),
             pins: PinIndex(connection: connection),
-            eviction: EvictionEngine(connection: connection, negativeCache: negativeCache),
-            negativeCache: negativeCache
+            eviction: EvictionEngine(connection: connection)
         )
     }
 
@@ -147,22 +151,93 @@ struct EvictionEngineTests {
         #expect(await h.pins.isPinReachable(cid: root), "still served after the sweep")
     }
 
-    /// A pin row CAN linger with count <= 0 (`pin(count: 0)` inserts one; only
-    /// the unpin paths delete such rows). The serve gate ignores it, so the
-    /// eviction seed must too — otherwise eviction would protect content the
-    /// gate never serves, and the two "live pin" predicates would drift.
-    @Test func zeroCountPinRowNeitherServesNorProtects() async throws {
+    @Test func danglingMembershipAndPinOwnNothing() async throws {
+        let h = try harness()
+        let root = cid("dangling")
+        try await h.store.storeVolumeLocal(volume("dangling"))
+        try await h.pins.pin(root: root, owner: "owner", count: 1, ttl: nil)
+        try await h.connection.write {
+            try h.connection.exec("PRAGMA foreign_keys=OFF")
+            do {
+                try h.connection.exec("DELETE FROM volume_metadata WHERE root='\(root)'")
+                try h.connection.exec("PRAGMA foreign_keys=ON")
+            } catch {
+                try? h.connection.exec("PRAGMA foreign_keys=ON")
+                throw error
+            }
+        }
+
+        #expect(!(await h.pins.isPinReachable(cid: root)))
+        #expect(try await h.eviction.evictUnpinned(graceSeconds: 0) == 0)
+        #expect(await casRowCount(connection: h.connection, cid: root) == 0)
+        #expect(await h.pins.owners(root: root).isEmpty)
+    }
+
+    @Test func cidInvalidVolumeCannotRetainStorage() async throws {
+        let h = try harness()
+        let retained = RetainedRootIndex(connection: h.connection)
+        let root = cid("corrupt")
+        try await h.store.storeVolumeLocal(volume("corrupt"))
+        try await retained.advanceRetainedRoots(
+            scope: "canonical",
+            roots: [root],
+            operationID: "retain-valid"
+        )
+        try await h.connection.write {
+            try h.connection.exec("UPDATE cas_data SET data=X'00' WHERE cid='\(root)'")
+        }
+
+        do {
+            try await retained.mergeRetainedRoots(
+                scope: "candidate",
+                roots: [root],
+                operationID: "retain-corrupt"
+            )
+            Issue.record("CID-invalid Volume must not become a retention root")
+        } catch {
+            #expect(error as? BrokerError == .missingRetainedRoot(root))
+        }
+        #expect(await retained.retainedRoots(scope: "canonical").isEmpty)
+        #expect(await casRowCount(connection: h.connection, cid: root) == 0)
+
+        try await h.store.storeVolumeLocal(volume("corrupt"))
+        try await retained.advanceRetainedRoots(
+            scope: "canonical",
+            roots: [root],
+            operationID: "retain-valid"
+        )
+        #expect(await retained.retainedRoots(scope: "canonical") == [root])
+        #expect(try await h.eviction.evictUnpinned(graceSeconds: 0) == 0)
+        #expect(await h.store.hasVolume(root: root))
+    }
+
+    @Test func quarantineSQLFailureNeverDeletesContent() async throws {
+        let h = try harness()
+        let root = cid("sql-failure")
+        try await h.store.storeVolumeLocal(volume("sql-failure"))
+        try await h.connection.write {
+            try h.connection.exec("UPDATE cas_data SET data=X'00' WHERE cid='\(root)'")
+        }
+
+        sqlite3_set_authorizer(h.connection.db, { _, action, _, _, _, _ in
+            action == SQLITE_READ ? SQLITE_DENY : SQLITE_OK
+        }, nil)
+        #expect(await h.store.fetchVolumeLocal(root: root) == nil)
+        sqlite3_set_authorizer(h.connection.db, nil, nil)
+
+        #expect(await casRowCount(connection: h.connection, cid: root) == 1)
+    }
+
+    @Test func nonpositivePinCountIsRejected() async throws {
         let h = try harness()
         let root = cid("r1")
         try await h.store.storeVolumeLocal(volume("r1"))
-        try await h.pins.pin(root: root, owner: "owner-a", count: 0, ttl: nil)
-
-        #expect(await h.pins.owners(root: root) == ["owner-a"],
-                "the count=0 row really lingers (owners() filters TTL only)")
-        #expect(await h.pins.isPinReachable(cid: root) == false,
-                "the serve gate must not serve a count<=0 row")
+        await #expect(throws: BrokerError.invalidPinCount) {
+            try await h.pins.pin(root: root, owner: "owner-a", count: 0, ttl: nil)
+        }
+        #expect(await h.pins.owners(root: root).isEmpty)
         let evicted = try await h.eviction.evictUnpinned(graceSeconds: 0)
-        #expect(evicted == 1, "a count<=0 row must not protect from eviction")
+        #expect(evicted == 1)
         #expect(await h.store.hasVolume(root: root) == false)
     }
 
@@ -188,18 +263,44 @@ struct EvictionEngineTests {
         #expect(await h.store.hasVolume(root: root) == false)
     }
 
-    /// Evicting a root releases its durable known-present negative-cache entry.
-    @Test func evictedRootClearsKnownPresent() async throws {
+    @Test func sharedBlobSurvivesGraceProtectedOwner() async throws {
         let h = try harness()
-        let root = cid("r1")
-        #expect(await h.store.hasVolume(root: root) == false)
-        try await h.store.storeVolumeLocal(volume("r1"))
-        #expect(h.negativeCache.mightBeAbsent(root) == false)
+        let shared = Data("shared".utf8)
+        let oldRoot = cid("old")
+        let freshRoot = cid("fresh")
+        try await h.store.storeVolumeLocal(volume("old", ["shared": shared]))
+        try await h.store.storeVolumeLocal(volume("fresh", ["shared": shared]))
+        try await h.connection.write {
+            try h.connection.exec("""
+                UPDATE volume_metadata
+                SET stored_at = datetime('now', '-2 hours')
+                WHERE root = '\(oldRoot)'
+                """)
+        }
 
-        let evicted = try await h.eviction.evictUnpinned(graceSeconds: 0)
+        let evicted = try await h.eviction.evictUnpinned(graceSeconds: 60 * 60)
         #expect(evicted == 1)
-        #expect(h.negativeCache.mightBeAbsent(root),
-                "after eviction, the prior absent bloom verdict is authoritative again")
+        #expect(await h.store.hasVolume(root: oldRoot) == false)
+        #expect(await h.store.hasVolume(root: freshRoot))
+        #expect(await h.store.fetchDataLocal(cid: cid(for: shared)) == shared)
+    }
+
+    @Test func sharedBlobIsDeletedAfterLastOwner() async throws {
+        let h = try harness()
+        let shared = Data("shared".utf8)
+        let sharedCID = cid(for: shared)
+        let keepRoot = cid("keep")
+        try await h.store.storeVolumeLocal(volume("keep", ["shared": shared]))
+        try await h.store.storeVolumeLocal(volume("drop", ["shared": shared]))
+        try await h.pins.pin(root: keepRoot, owner: "owner", count: 1, ttl: nil)
+
+        _ = try await h.eviction.evictUnpinned(graceSeconds: 0)
+        #expect(await casRowCount(connection: h.connection, cid: sharedCID) == 1)
+
+        try await h.pins.unpin(root: keepRoot, owner: "owner", count: 1)
+        _ = try await h.eviction.evictUnpinned(graceSeconds: 0)
+        #expect(await casRowCount(connection: h.connection, cid: sharedCID) == 0)
+        #expect(await h.store.fetchDataLocal(cid: sharedCID) == nil)
     }
 
     private func storeVolumes(_ h: Harness, _ volumes: [SerializedVolume]) async throws {
@@ -272,5 +373,22 @@ struct EvictionEngineTests {
         #expect(await h.store.fetchDataLocal(cid: txDict) != nil)
         #expect(await h.store.hasVolume(root: txBody) == false)
         #expect(await h.store.hasVolume(root: postState) == false)
+    }
+
+    private func casRowCount(connection: SQLiteConnection, cid: String) async -> Int {
+        await connection.read {
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_prepare_v2(
+                connection.readDb,
+                "SELECT COUNT(*) FROM cas_data WHERE cid = ?1",
+                -1,
+                &stmt,
+                nil
+            ) == SQLITE_OK, let stmt else { return -1 }
+            sqlite3_bind_text(stmt, 1, cid, -1, SQLITE_TRANSIENT_SHIM)
+            guard sqlite3_step(stmt) == SQLITE_ROW else { return -1 }
+            return Int(sqlite3_column_int64(stmt, 0))
+        }
     }
 }

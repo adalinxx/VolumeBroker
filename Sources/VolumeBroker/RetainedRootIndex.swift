@@ -95,7 +95,7 @@ struct RetainedRootIndex {
 
     func retainedRoots(scope: String) async -> [String] {
         guard !scope.isEmpty else { return [] }
-        return await connection.read {
+        let roots: [String] = await connection.read {
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
             let sql = "SELECT root FROM retained_roots WHERE scope=?1 ORDER BY root"
@@ -109,6 +109,12 @@ struct RetainedRootIndex {
             }
             return result
         }
+        let volumes = CASVolumeStore(connection: connection)
+        var valid: [String] = []
+        for root in roots {
+            if await volumes.hasVolume(root: root) { valid.append(root) }
+        }
+        return valid
     }
 
     private static func canonicalRoots(_ roots: [String]) throws -> [String] {
@@ -139,31 +145,11 @@ struct RetainedRootIndex {
     }
 
     private func validateStoredVolume(root: String) throws {
-        var stmt: OpaquePointer?
-        defer { sqlite3_finalize(stmt) }
-        let sql = """
-            SELECT ?1
-            WHERE NOT EXISTS (
-                SELECT 1 FROM volume_metadata WHERE root = ?1
-            ) OR NOT EXISTS (
-                SELECT 1
-                FROM volume_entries ve
-                JOIN cas_data cd ON cd.cid = ve.cid
-                WHERE ve.root = ?1 AND ve.cid = ?1
-            ) OR EXISTS (
-                SELECT 1 FROM volume_entries ve
-                LEFT JOIN cas_data cd ON cd.cid = ve.cid
-                WHERE ve.root = ?1 AND cd.cid IS NULL
-            )
-            LIMIT 1
-            """
-        guard sqlite3_prepare_v2(connection.db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
-        }
-        sqlite3_bind_text(stmt, 1, root, -1, SQLITE_TRANSIENT_SHIM)
-        if sqlite3_step(stmt) == SQLITE_ROW {
-            let missing = sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? root
-            throw BrokerError.missingRetainedRoot(missing)
+        guard case .volume = try CASVolumeStore.loadValidatedVolume(
+            root: root,
+            db: connection.db
+        ) else {
+            throw BrokerError.missingRetainedRoot(root)
         }
     }
 }

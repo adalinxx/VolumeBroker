@@ -5,12 +5,10 @@ import Foundation
 /// `DiskBroker` composes the layered storage components and delegates to them;
 /// it owns no SQL itself. The layers are:
 ///   - `SQLiteConnection` — connection/PRAGMA/schema + serialised read/write access.
-///   - `NegativeCache`     — bloom + known-present negative-cache policy.
 ///   - `CASVolumeStore`    — content-addressed volume store (store/fetch/has).
 ///   - `PinIndex`          — ref-counted pins, TTL, idempotent batch unpins.
 ///   - `RetainedRootIndex` — named durable retained-root sets.
 ///   - `EvictionEngine`    — TTL prune + unpinned CAS/entry/metadata reclaim.
-///   - `ChainMetaStore`    — chain metadata key/value store.
 public final class DiskBroker: @unchecked Sendable, VolumeBroker, RetainedRootBroker, RetainedRootMergeBroker {
     public var near: (any VolumeBroker)?
     public var far: (any VolumeBroker)?
@@ -20,18 +18,15 @@ public final class DiskBroker: @unchecked Sendable, VolumeBroker, RetainedRootBr
     private let pins: PinIndex
     private let retainedRoots: RetainedRootIndex
     private let eviction: EvictionEngine
-    private let chainMeta: ChainMetaStore
     private let evictUnpinnedGraceSeconds: Int
 
     public init(path: String, evictUnpinnedGraceSeconds: Int = 600) throws {
         let connection = try SQLiteConnection(path: path)
-        let negativeCache = NegativeCache()
         self.connection = connection
-        self.volumes = CASVolumeStore(connection: connection, negativeCache: negativeCache)
+        self.volumes = CASVolumeStore(connection: connection)
         self.pins = PinIndex(connection: connection)
         self.retainedRoots = RetainedRootIndex(connection: connection)
-        self.eviction = EvictionEngine(connection: connection, negativeCache: negativeCache)
-        self.chainMeta = ChainMetaStore(connection: connection)
+        self.eviction = EvictionEngine(connection: connection)
         self.evictUnpinnedGraceSeconds = evictUnpinnedGraceSeconds
     }
 
@@ -51,10 +46,6 @@ public final class DiskBroker: @unchecked Sendable, VolumeBroker, RetainedRootBr
 
     public func storeVolumesLocal(_ volumes: [SerializedVolume]) async throws {
         try await self.volumes.storeVolumesLocal(volumes)
-    }
-
-    public func storeVolumeLocal(_ volume: SerializedVolume) async throws {
-        try await volumes.storeVolumeLocal(volume)
     }
 
     // MARK: - Pins
@@ -150,11 +141,4 @@ public final class DiskBroker: @unchecked Sendable, VolumeBroker, RetainedRootBr
 
     // MARK: - Chain Meta
 
-    public func getChainMeta(key: String) async -> String? {
-        await chainMeta.getChainMeta(key: key)
-    }
-
-    public func setChainMeta(key: String, value: String) async throws {
-        try await chainMeta.setChainMeta(key: key, value: value)
-    }
 }

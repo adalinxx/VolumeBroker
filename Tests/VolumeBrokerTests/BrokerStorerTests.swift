@@ -2,6 +2,7 @@ import CID
 import Foundation
 import Multihash
 import Testing
+import cashew
 @testable import VolumeBroker
 
 @Suite("BrokerStorer")
@@ -14,18 +15,20 @@ struct BrokerStorerTests {
         var near: (any VolumeBroker)?
         var far: (any VolumeBroker)?
         var failNextStore = true
+        private(set) var attempts: [(root: String, entries: [String: Data])] = []
         let backing = MemoryBroker()
 
         func hasVolume(root: String) async -> Bool { await backing.hasVolume(root: root) }
         func fetchVolumeLocal(root: String) async -> SerializedVolume? {
             await backing.fetchVolumeLocal(root: root)
         }
-        func storeVolumeLocal(_ volume: SerializedVolume) async throws {
+        func storeVolumesLocal(_ volumes: [SerializedVolume]) async throws {
+            attempts.append(contentsOf: volumes.map { ($0.root, $0.entries) })
             if failNextStore {
                 failNextStore = false
                 throw InjectedFailure.store
             }
-            try await backing.storeVolumeLocal(volume)
+            try await backing.storeVolumesLocal(volumes)
         }
         func pin(root: String, owner: String, count: Int, ttl: Duration?) async throws {
             try await backing.pin(root: root, owner: owner, count: count, ttl: ttl)
@@ -62,18 +65,12 @@ struct BrokerStorerTests {
         #expect(await broker.fetchVolumeLocal(root: child) == nil)
     }
 
-    @Test func storesSparseEntriesAsIndependentVolumes() async throws {
+    @Test func conformsToVolumeStorerButNotRawStorer() {
         let broker = MemoryBroker()
         let storer = BrokerStorer(broker: broker)
-        let firstData = Data("first".utf8)
-        let secondData = Data("second".utf8)
-        let first = cid(for: firstData)
-        let second = cid(for: secondData)
 
-        try await storer.store(entries: [first: firstData, second: secondData])
-
-        #expect(await broker.fetchVolumeLocal(root: first)?.entries == [first: firstData])
-        #expect(await broker.fetchVolumeLocal(root: second)?.entries == [second: secondData])
+        #expect((storer as Any) is any VolumeStorer)
+        #expect(!((storer as Any) is any Storer))
     }
 
     @Test func volumePayloadsRemainIndependent() async throws {
@@ -113,5 +110,32 @@ struct BrokerStorerTests {
 
         try await storer.store(volume: volume)
         #expect(await broker.hasVolume(root: root))
+        #expect(broker.attempts.count == 2)
+        #expect(broker.attempts[0].root == root)
+        #expect(broker.attempts[0].entries == volume.entries)
+        #expect(broker.attempts[1].root == root)
+        #expect(broker.attempts[1].entries == volume.entries)
+    }
+
+    @Test func storedParentSurvivesLaterChildFailure() async throws {
+        let broker = FlakyBroker()
+        let storer = BrokerStorer(broker: broker)
+        let parentData = Data("parent".utf8)
+        let childData = Data("child".utf8)
+        let parent = cid(for: parentData)
+        let child = cid(for: childData)
+
+        broker.failNextStore = false
+        try await storer.store(volume: SerializedVolume(root: parent, entries: [parent: parentData]))
+        broker.failNextStore = true
+        do {
+            try await storer.store(volume: SerializedVolume(root: child, entries: [child: childData]))
+            Issue.record("expected child store to fail")
+        } catch {
+            #expect(error as? InjectedFailure == .store)
+        }
+
+        #expect(await broker.hasVolume(root: parent))
+        #expect(await broker.hasVolume(root: child) == false)
     }
 }

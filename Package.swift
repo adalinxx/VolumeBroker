@@ -8,7 +8,7 @@ let package = Package(
         .library(name: "VolumeBroker", targets: ["VolumeBroker"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/adalinxx/cashew.git", exact: "4.0.0"),
+        .package(url: "https://github.com/adalinxx/cashew.git", from: "4.0.1"),
         .package(url: "https://github.com/adalinxx/ArrayTrie.git", from: "1.0.0"),
         .package(url: "https://github.com/swift-libp2p/swift-cid.git", from: "0.0.1"),
         .package(url: "https://github.com/swift-libp2p/swift-multihash.git", from: "0.0.1"),
@@ -33,6 +33,8 @@ let package = Package(
             name: "VolumeBrokerTests",
             dependencies: [
                 "VolumeBroker",
+                "VolumeBrokerSQLite",
+                .product(name: "cashew", package: "cashew"),
                 .product(name: "CID", package: "swift-cid"),
                 .product(name: "Multihash", package: "swift-multihash"),
             ]
