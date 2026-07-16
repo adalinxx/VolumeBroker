@@ -8,9 +8,10 @@ let package = Package(
         .library(name: "VolumeBroker", targets: ["VolumeBroker"]),
     ],
     dependencies: [
-        // Stacked with the cashew targeted-Volume storage PR. Replace with its
-        // release tag before merging this coordinated redesign series.
-        .package(url: "https://github.com/adalinxx/cashew.git", branch: "agent/foundational-architecture-alignment"),
+        .package(
+            url: "https://github.com/adalinxx/cashew.git",
+            revision: "24831f2e1a9d995f6e303602828db9c192216249"
+        ),
         .package(url: "https://github.com/adalinxx/ArrayTrie.git", from: "1.0.0"),
         .package(url: "https://github.com/swift-libp2p/swift-cid.git", from: "0.0.1"),
         .package(url: "https://github.com/swift-libp2p/swift-multihash.git", from: "0.0.1"),

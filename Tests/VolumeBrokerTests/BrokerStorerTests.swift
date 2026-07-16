@@ -62,6 +62,20 @@ struct BrokerStorerTests {
         #expect(await broker.fetchVolumeLocal(root: child) == nil)
     }
 
+    @Test func storesSparseEntriesAsIndependentVolumes() async throws {
+        let broker = MemoryBroker()
+        let storer = BrokerStorer(broker: broker)
+        let firstData = Data("first".utf8)
+        let secondData = Data("second".utf8)
+        let first = cid(for: firstData)
+        let second = cid(for: secondData)
+
+        try await storer.store(entries: [first: firstData, second: secondData])
+
+        #expect(await broker.fetchVolumeLocal(root: first)?.entries == [first: firstData])
+        #expect(await broker.fetchVolumeLocal(root: second)?.entries == [second: secondData])
+    }
+
     @Test func volumePayloadsRemainIndependent() async throws {
         let broker = MemoryBroker()
         let storer = BrokerStorer(broker: broker)
