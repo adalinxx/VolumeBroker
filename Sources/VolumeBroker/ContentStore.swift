@@ -32,10 +32,6 @@ public actor ContentStore {
         await broker.fetchData(cid: rootCID) != nil
     }
 
-    public func hasDurable(_ rootCID: String) async -> Bool {
-        await broker.hasVolume(root: rootCID)
-    }
-
     // MARK: - Write
 
     /// Store a whole object and every materialized nested Volume.

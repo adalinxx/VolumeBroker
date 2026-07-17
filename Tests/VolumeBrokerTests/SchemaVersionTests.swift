@@ -106,6 +106,65 @@ struct SchemaVersionTests {
         #expect(readForeignKeys == 1)
     }
 
+    @Test func writeConnectionUsesFullSynchronous() throws {
+        let location = try temporaryDatabase()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        let connection = try SQLiteConnection(path: location.path)
+
+        #expect(try scalar(connection.db, "PRAGMA synchronous") == 2)
+    }
+
+    @Test func freshSchemaOmitsOperationJournals() throws {
+        let location = try temporaryDatabase()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        _ = try DiskBroker(path: location.path)
+
+        try withDatabase(at: location.path) { db in
+            let operationTables = try scalar(db, """
+                SELECT COUNT(*) FROM sqlite_schema
+                WHERE type='table'
+                  AND name IN ('volume_unpin_operations', 'retained_root_operations')
+                """)
+            #expect(operationTables == 0)
+        }
+    }
+
+    @Test func legacyOperationTablesReopenUntouched() throws {
+        let location = try temporaryDatabase()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        _ = try DiskBroker(path: location.path)
+        try withDatabase(at: location.path) { db in
+            try execute(db, """
+                CREATE TABLE volume_unpin_operations (
+                    operation_id TEXT PRIMARY KEY
+                )
+                """)
+            try execute(db, """
+                CREATE TABLE retained_root_operations (
+                    operation_id TEXT PRIMARY KEY,
+                    scope TEXT NOT NULL,
+                    canonical_roots TEXT NOT NULL
+                )
+                """)
+            try execute(db, "INSERT INTO volume_unpin_operations VALUES('legacy-unpin')")
+            try execute(db, "INSERT INTO retained_root_operations VALUES('legacy-retain', 'scope', '[]')")
+        }
+
+        _ = try DiskBroker(path: location.path)
+        try withDatabase(at: location.path) { db in
+            let unpinRows = try scalar(
+                db,
+                "SELECT COUNT(*) FROM volume_unpin_operations WHERE operation_id='legacy-unpin'"
+            )
+            let retainedRows = try scalar(
+                db,
+                "SELECT COUNT(*) FROM retained_root_operations WHERE operation_id='legacy-retain'"
+            )
+            #expect(unpinRows == 1)
+            #expect(retainedRows == 1)
+        }
+    }
+
     @Test func concurrentFreshOpenInitializesOnce() async throws {
         let location = try temporaryDatabase()
         defer { try? FileManager.default.removeItem(at: location.directory) }

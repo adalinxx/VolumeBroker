@@ -25,14 +25,32 @@ public protocol VolumeBroker: AnyObject, Sendable {
 /// set of roots. Retained roots are independent from owner/count pins and
 /// protect the named Volumes from eviction.
 public protocol RetainedRootBroker: VolumeBroker {
-    func advanceRetainedRoots(scope: String, roots: [String], operationID: String) async throws
-    func retainedRoots(scope: String) async -> [String]
+    func advanceRetainedRoots(scope: String, roots: [String]) async throws
+    func retainedRoots(scope: String) async throws -> [String]
 }
 
 /// Optional retained-root surface for brokers that can atomically add roots to
 /// an existing scope without replacing or retransmitting the full scope.
 public protocol RetainedRootMergeBroker: RetainedRootBroker {
-    func mergeRetainedRoots(scope: String, roots: [String], operationID: String) async throws
+    func mergeRetainedRoots(scope: String, roots: [String]) async throws
+}
+
+public extension RetainedRootBroker {
+    /// `operationID` is ignored and retained only for temporary source compatibility.
+    @available(*, deprecated, message: "operationID is ignored; this overload exists only for temporary source compatibility")
+    func advanceRetainedRoots(scope: String, roots: [String], operationID: String) async throws {
+        _ = operationID
+        try await advanceRetainedRoots(scope: scope, roots: roots)
+    }
+}
+
+public extension RetainedRootMergeBroker {
+    /// `operationID` is ignored and retained only for temporary source compatibility.
+    @available(*, deprecated, message: "operationID is ignored; this overload exists only for temporary source compatibility")
+    func mergeRetainedRoots(scope: String, roots: [String], operationID: String) async throws {
+        _ = operationID
+        try await mergeRetainedRoots(scope: scope, roots: roots)
+    }
 }
 
 public extension VolumeBroker {

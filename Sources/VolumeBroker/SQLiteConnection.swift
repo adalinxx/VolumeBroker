@@ -82,6 +82,19 @@ final class SQLiteConnection: @unchecked Sendable {
         }
     }
 
+    /// Run a throwing read on the concurrent read queue.
+    func read<T: Sendable>(_ body: @escaping @Sendable () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            readQueue.async {
+                do {
+                    continuation.resume(returning: try body())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
     /// Run a write on the serial write queue against the write connection.
     func write<T: Sendable>(_ body: @escaping @Sendable () throws -> T) async throws -> T {
         try await withCheckedThrowingContinuation { continuation in
@@ -136,9 +149,6 @@ final class SQLiteConnection: @unchecked Sendable {
             throw error
         }
     }
-
-    /// Number of rows changed by the most recent write statement.
-    func changes() -> Int { Int(sqlite3_changes(db)) }
 
     // MARK: - Schema
 
@@ -222,23 +232,11 @@ final class SQLiteConnection: @unchecked Sendable {
                 PRIMARY KEY (root, owner)
             )
             """),
-        ("volume_unpin_operations", """
-            CREATE TABLE volume_unpin_operations (
-                operation_id TEXT PRIMARY KEY
-            )
-            """),
         ("retained_roots", """
             CREATE TABLE retained_roots (
                 scope TEXT NOT NULL,
                 root TEXT NOT NULL,
                 PRIMARY KEY (scope, root)
-            )
-            """),
-        ("retained_root_operations", """
-            CREATE TABLE retained_root_operations (
-                operation_id TEXT PRIMARY KEY,
-                scope TEXT NOT NULL,
-                canonical_roots TEXT NOT NULL
             )
             """),
     ]
@@ -324,7 +322,10 @@ final class SQLiteConnection: @unchecked Sendable {
         try execRaw(db: db, "PRAGMA journal_mode=WAL")
         // Reads and writes wait out short WAL/checkpoint contention windows.
         try execRaw(db: db, "PRAGMA busy_timeout=5000")
-        try execRaw(db: db, "PRAGMA synchronous=NORMAL")
+        try execRaw(db: db, "PRAGMA synchronous=FULL")
+        guard try scalarInt(db: db, "PRAGMA synchronous") == 2 else {
+            throw BrokerError.sqlFailed("SQLite synchronous=FULL unavailable")
+        }
         try execRaw(db: db, "PRAGMA cache_size=-65536")
         try execRaw(db: db, "PRAGMA mmap_size=268435456")
         try execRaw(db: db, "PRAGMA temp_store=MEMORY")

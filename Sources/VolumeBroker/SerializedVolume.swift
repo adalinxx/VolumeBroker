@@ -24,6 +24,19 @@ public extension SerializedVolume {
 
         for (rawCID, data) in entries {
             let expected = try parsedCID(rawCID)
+            let canonical: CID
+            do {
+                canonical = try CID(
+                    version: expected.version,
+                    codec: expected.codec,
+                    multihash: expected.multihash
+                )
+            } catch {
+                throw SerializedVolumeError.invalidCID(rawCID)
+            }
+            guard canonical.toBaseEncodedString == rawCID else {
+                throw SerializedVolumeError.invalidCID(rawCID)
+            }
             guard let algorithm = expected.multihash.algorithm,
                   let digestLength = expected.multihash.length,
                   let expectedDigest = expected.multihash.digest,
@@ -33,8 +46,7 @@ public extension SerializedVolume {
             if expected.version == .v0 {
                 guard expected.codec == .dag_pb,
                       algorithm == .sha2_256,
-                      digestLength == 32,
-                      expected.toBaseEncodedString == rawCID else {
+                      digestLength == 32 else {
                     throw SerializedVolumeError.invalidCID(rawCID)
                 }
             }

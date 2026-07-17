@@ -7,9 +7,8 @@ import VolumeBrokerSQLite
 
 /// Pin reference-count index.
 ///
-/// Owns the `volume_pins` and `volume_unpin_operations` tables: ref-counted
-/// pins per (root, owner), TTL expiry timestamps, idempotent batched unpins,
-/// and owner/prefix-scoped pinned-root queries.
+/// Owns the `volume_pins` table: ref-counted pins per (root, owner), TTL expiry
+/// timestamps, batched updates, and owner/prefix-scoped pinned-root queries.
 struct PinIndex {
     let connection: SQLiteConnection
 
@@ -106,39 +105,6 @@ struct PinIndex {
         if items.count == 1 { try await unpin(root: items[0].root, owner: items[0].owner, count: items[0].count); return }
         try await connection.write {
             try connection.transaction {
-                for item in items {
-                    try connection.execBind("DELETE FROM volume_pins WHERE root=?1 AND owner=?2 AND count <= ?3") { stmt in
-                        sqlite3_bind_text(stmt, 1, item.root, -1, SQLITE_TRANSIENT_SHIM)
-                        sqlite3_bind_text(stmt, 2, item.owner, -1, SQLITE_TRANSIENT_SHIM)
-                        sqlite3_bind_int64(stmt, 3, Int64(item.count))
-                    }
-                    try connection.execBind("UPDATE volume_pins SET count = count - ?3 WHERE root=?1 AND owner=?2") { stmt in
-                        sqlite3_bind_text(stmt, 1, item.root, -1, SQLITE_TRANSIENT_SHIM)
-                        sqlite3_bind_text(stmt, 2, item.owner, -1, SQLITE_TRANSIENT_SHIM)
-                        sqlite3_bind_int64(stmt, 3, Int64(item.count))
-                    }
-                }
-            }
-        }
-    }
-
-    /// Apply a counted unpin batch at most once for `operationID`.
-    ///
-    /// The operation marker and pin decrements live in the same transaction, so
-    /// callers can safely retry cleanup after a process crash: if the prior
-    /// transaction committed, the retry is a no-op; if it did not, the retry
-    /// applies the decrements exactly once.
-    func unpinBatchOnce(operationID: String, items: [(root: String, owner: String, count: Int)]) async throws {
-        guard !operationID.isEmpty, !items.isEmpty else { return }
-        guard items.allSatisfy({ $0.count > 0 }) else { throw BrokerError.invalidPinCount }
-        try await connection.write {
-            try connection.transaction {
-                try connection.execBind("INSERT OR IGNORE INTO volume_unpin_operations(operation_id) VALUES(?1)") { stmt in
-                    sqlite3_bind_text(stmt, 1, operationID, -1, SQLITE_TRANSIENT_SHIM)
-                }
-                guard connection.changes() > 0 else {
-                    return
-                }
                 for item in items {
                     try connection.execBind("DELETE FROM volume_pins WHERE root=?1 AND owner=?2 AND count <= ?3") { stmt in
                         sqlite3_bind_text(stmt, 1, item.root, -1, SQLITE_TRANSIENT_SHIM)
@@ -326,85 +292,6 @@ struct PinIndex {
                 }
             }
             return result
-        }
-    }
-
-    /// Delete idempotency markers whose operation id begins with `prefix` and
-    /// whose last colon-delimited component is a parseable height below
-    /// `belowHeight`.
-    func deleteUnpinOperations(belowHeight: Int, prefix: String) async throws -> Int {
-        guard belowHeight > 0, !prefix.isEmpty else { return 0 }
-        let operationIDs = await unpinOperationIDs(prefix: prefix)
-        let expiredIDs = operationIDs.filter { operationID in
-            guard let last = operationID.split(separator: ":").last,
-                  let height = Int(String(last)) else { return false }
-            return height < belowHeight
-        }
-        guard !expiredIDs.isEmpty else { return 0 }
-        try await connection.write {
-            try connection.transaction {
-                for operationID in expiredIDs {
-                    try connection.execBind("DELETE FROM volume_unpin_operations WHERE operation_id=?1") { stmt in
-                        sqlite3_bind_text(stmt, 1, operationID, -1, SQLITE_TRANSIENT_SHIM)
-                    }
-                }
-            }
-        }
-        return expiredIDs.count
-    }
-
-    func unpinOperationCount(prefix: String? = nil) async -> Int {
-        await connection.read {
-            var stmt: OpaquePointer?
-            defer { sqlite3_finalize(stmt) }
-            let sql: String
-            if prefix == nil {
-                sql = "SELECT COUNT(*) FROM volume_unpin_operations"
-            } else {
-                sql = "SELECT COUNT(*) FROM volume_unpin_operations WHERE operation_id >= ?1 AND operation_id < ?2"
-            }
-            guard sqlite3_prepare_v2(connection.readDb, sql, -1, &stmt, nil) == SQLITE_OK else { return 0 }
-            if let prefix {
-                sqlite3_bind_text(stmt, 1, prefix, -1, SQLITE_TRANSIENT_SHIM)
-                sqlite3_bind_text(stmt, 2, prefixUpperBound(prefix), -1, SQLITE_TRANSIENT_SHIM)
-            }
-            guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
-            return Int(sqlite3_column_int64(stmt, 0))
-        }
-    }
-
-    func deleteUnpinOperations(prefix: String) async throws -> Int {
-        guard !prefix.isEmpty else { return 0 }
-        return try await connection.write {
-            try connection.execBind("""
-                DELETE FROM volume_unpin_operations
-                WHERE operation_id >= ?1 AND operation_id < ?2
-                """) { stmt in
-                sqlite3_bind_text(stmt, 1, prefix, -1, SQLITE_TRANSIENT_SHIM)
-                sqlite3_bind_text(stmt, 2, prefixUpperBound(prefix), -1, SQLITE_TRANSIENT_SHIM)
-            }
-            return connection.changes()
-        }
-    }
-
-    private func unpinOperationIDs(prefix: String) async -> [String] {
-        await connection.read {
-            var stmt: OpaquePointer?
-            defer { sqlite3_finalize(stmt) }
-            let sql = """
-                SELECT operation_id FROM volume_unpin_operations
-                WHERE operation_id >= ?1 AND operation_id < ?2
-                """
-            guard sqlite3_prepare_v2(connection.readDb, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
-            sqlite3_bind_text(stmt, 1, prefix, -1, SQLITE_TRANSIENT_SHIM)
-            sqlite3_bind_text(stmt, 2, prefixUpperBound(prefix), -1, SQLITE_TRANSIENT_SHIM)
-            var ids: [String] = []
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                if let ptr = sqlite3_column_text(stmt, 0) {
-                    ids.append(String(cString: ptr))
-                }
-            }
-            return ids
         }
     }
 

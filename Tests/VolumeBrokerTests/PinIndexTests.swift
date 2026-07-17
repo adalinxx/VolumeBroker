@@ -12,8 +12,8 @@ import VolumeBrokerSQLite
 /// Independent unit tests for the `PinIndex` collaborator.
 ///
 /// These construct `PinIndex` directly from a bare `SQLiteConnection` rather
-/// than going through the `DiskBroker` façade, so pin-count / TTL / idempotency
-/// semantics are pinned to the collaborator's own surface.
+/// than going through the `DiskBroker` façade, so pin-count and TTL semantics
+/// are pinned to the collaborator's own surface.
 @Suite("PinIndex")
 struct PinIndexTests {
 
@@ -173,24 +173,6 @@ struct PinIndexTests {
         #expect(await h.pins.owners(root: root).isEmpty, "a zero-TTL pin is immediately stale")
     }
 
-    /// `unpinBatchOnce` is idempotent per operation id: replaying the same id
-    /// must not decrement twice, but a fresh id still applies.
-    @Test func unpinBatchOnceIsIdempotent() async throws {
-        let h = try await tempIndex()
-        let root = try #require(h.roots["r1"])
-        try await h.pins.pin(root: root, owner: "owner-a", count: 2, ttl: nil)
-
-        let items = [(root: root, owner: "owner-a", count: 1)]
-        try await h.pins.unpinBatchOnce(operationID: "op-1", items: items)
-        #expect(await h.pins.owners(root: root) == ["owner-a"], "first apply leaves count=1")
-
-        try await h.pins.unpinBatchOnce(operationID: "op-1", items: items)
-        #expect(await h.pins.owners(root: root) == ["owner-a"], "replay of op-1 is a no-op")
-
-        try await h.pins.unpinBatchOnce(operationID: "op-2", items: items)
-        #expect(await h.pins.owners(root: root).isEmpty, "a distinct op id still decrements")
-    }
-
     @Test func pinnedOwnersByPrefix() async throws {
         let h = try await tempIndex(["r1", "r2", "r3", "r4"])
         try await h.pins.pin(root: try #require(h.roots["r1"]), owner: "candidate:ns:5", count: 1, ttl: nil)
@@ -200,23 +182,5 @@ struct PinIndexTests {
 
         let owners = Set(await h.pins.pinnedOwners(prefix: "candidate:ns:"))
         #expect(owners == ["candidate:ns:5", "candidate:ns:6"])
-    }
-
-    @Test func deleteUnpinOperationsBelowHeightByPrefix() async throws {
-        let pins = try await tempIndex([]).pins
-        let item = (root: "missing", owner: "owner", count: 1)
-        try await pins.unpinBatchOnce(operationID: "prune:candidate:ns:5", items: [item])
-        try await pins.unpinBatchOnce(operationID: "prune:candidate:ns:6", items: [item])
-        try await pins.unpinBatchOnce(operationID: "prune:candidate:ns:not-a-height", items: [item])
-        try await pins.unpinBatchOnce(operationID: "prune:other:4", items: [item])
-
-        let deleted = try await pins.deleteUnpinOperations(belowHeight: 6, prefix: "prune:candidate:ns:")
-        #expect(deleted == 1)
-        #expect(await pins.unpinOperationCount(prefix: "prune:candidate:ns:") == 2)
-        #expect(await pins.unpinOperationCount(prefix: "prune:other:") == 1)
-
-        let bulkDeleted = try await pins.deleteUnpinOperations(prefix: "prune:candidate:ns:")
-        #expect(bulkDeleted == 2)
-        #expect(await pins.unpinOperationCount(prefix: "prune:candidate:ns:") == 0)
     }
 }

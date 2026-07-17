@@ -11,7 +11,6 @@ public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRoot
         var insertedAt: [String: ContinuousClock.Instant] = [:]
         var pins: [String: [String: PinEntry]] = [:]
         var retainedRoots: [String: Set<String>] = [:]
-        var retainedRootOperations: [String: (scope: String, payload: String)] = [:]
         var lru = LRUOrder()
     }
 
@@ -280,55 +279,35 @@ public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRoot
         }
     }
 
-    public func advanceRetainedRoots(scope: String, roots: [String], operationID: String) async throws {
+    public func advanceRetainedRoots(scope: String, roots: [String]) async throws {
         let canonicalRoots = try Self.canonicalRetainedRoots(roots)
         guard !scope.isEmpty else {
-            throw BrokerError.invalidRetainedRootOperation("scope must not be empty")
-        }
-        guard !operationID.isEmpty else {
-            throw BrokerError.invalidRetainedRootOperation("operationID must not be empty")
+            throw BrokerError.invalidRetainedRoots("scope must not be empty")
         }
 
         try lock.withWriteLock {
-            if let existing = state.retainedRootOperations[operationID] {
-                guard existing.scope == scope && existing.payload == Self.operationPayload(kind: "replace", roots: canonicalRoots) else {
-                    throw BrokerError.conflictingRetainedRootOperation(operationID)
-                }
-                return
-            }
             for root in canonicalRoots {
                 try Self.validateRetainedVolume(root: root, state: state)
             }
             state.retainedRoots[scope] = Set(canonicalRoots)
-            state.retainedRootOperations[operationID] = (scope, Self.operationPayload(kind: "replace", roots: canonicalRoots))
         }
     }
 
-    public func mergeRetainedRoots(scope: String, roots: [String], operationID: String) async throws {
+    public func mergeRetainedRoots(scope: String, roots: [String]) async throws {
         let canonicalRoots = try Self.canonicalRetainedRoots(roots)
         guard !scope.isEmpty else {
-            throw BrokerError.invalidRetainedRootOperation("scope must not be empty")
-        }
-        guard !operationID.isEmpty else {
-            throw BrokerError.invalidRetainedRootOperation("operationID must not be empty")
+            throw BrokerError.invalidRetainedRoots("scope must not be empty")
         }
 
         try lock.withWriteLock {
-            if let existing = state.retainedRootOperations[operationID] {
-                guard existing.scope == scope && existing.payload == Self.operationPayload(kind: "merge", roots: canonicalRoots) else {
-                    throw BrokerError.conflictingRetainedRootOperation(operationID)
-                }
-                return
-            }
             for root in canonicalRoots {
                 try Self.validateRetainedVolume(root: root, state: state)
             }
             state.retainedRoots[scope, default: []].formUnion(canonicalRoots)
-            state.retainedRootOperations[operationID] = (scope, Self.operationPayload(kind: "merge", roots: canonicalRoots))
         }
     }
 
-    public func retainedRoots(scope: String) async -> [String] {
+    public func retainedRoots(scope: String) async throws -> [String] {
         guard !scope.isEmpty else { return [] }
         return lock.withReadLock {
             Array(state.retainedRoots[scope] ?? []).sorted()
@@ -397,13 +376,9 @@ public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRoot
     private static func canonicalRetainedRoots(_ roots: [String]) throws -> [String] {
         let unique = Array(Set(roots))
         if unique.contains(where: { $0.isEmpty }) {
-            throw BrokerError.invalidRetainedRootOperation("roots must not contain empty strings")
+            throw BrokerError.invalidRetainedRoots("roots must not contain empty strings")
         }
         return unique.sorted()
-    }
-
-    private static func operationPayload(kind: String, roots: [String]) -> String {
-        "\(kind):\(roots.joined(separator: "\n"))"
     }
 
     private static func validateRetainedVolume(root: String, state: State) throws {

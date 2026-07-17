@@ -6,7 +6,7 @@ import Foundation
 /// it owns no SQL itself. The layers are:
 ///   - `SQLiteConnection` — connection/PRAGMA/schema + serialised read/write access.
 ///   - `CASVolumeStore`    — content-addressed volume store (store/fetch/has).
-///   - `PinIndex`          — ref-counted pins, TTL, idempotent batch unpins.
+///   - `PinIndex`          — ref-counted pins, TTL, and batched updates.
 ///   - `RetainedRootIndex` — named durable retained-root sets.
 ///   - `EvictionEngine`    — TTL prune + unpinned CAS/entry/metadata reclaim.
 public final class DiskBroker: @unchecked Sendable, VolumeBroker, RetainedRootBroker, RetainedRootMergeBroker {
@@ -62,10 +62,6 @@ public final class DiskBroker: @unchecked Sendable, VolumeBroker, RetainedRootBr
         try await pins.unpinBatch(items: items)
     }
 
-    public func unpinBatchOnce(operationID: String, items: [(root: String, owner: String, count: Int)]) async throws {
-        try await pins.unpinBatchOnce(operationID: operationID, items: items)
-    }
-
     public func unpin(root: String, owner: String, count: Int) async throws {
         try await pins.unpin(root: root, owner: owner, count: count)
     }
@@ -99,30 +95,18 @@ public final class DiskBroker: @unchecked Sendable, VolumeBroker, RetainedRootBr
         await pins.pinnedOwners(prefix: prefix)
     }
 
-    public func deleteUnpinOperations(belowHeight: Int, prefix: String) async throws -> Int {
-        try await pins.deleteUnpinOperations(belowHeight: belowHeight, prefix: prefix)
-    }
-
-    public func unpinOperationCount(prefix: String? = nil) async -> Int {
-        await pins.unpinOperationCount(prefix: prefix)
-    }
-
-    public func deleteUnpinOperations(prefix: String) async throws -> Int {
-        try await pins.deleteUnpinOperations(prefix: prefix)
-    }
-
     // MARK: - Retained Roots
 
-    public func advanceRetainedRoots(scope: String, roots: [String], operationID: String) async throws {
-        try await retainedRoots.advanceRetainedRoots(scope: scope, roots: roots, operationID: operationID)
+    public func advanceRetainedRoots(scope: String, roots: [String]) async throws {
+        try await retainedRoots.advanceRetainedRoots(scope: scope, roots: roots)
     }
 
-    public func mergeRetainedRoots(scope: String, roots: [String], operationID: String) async throws {
-        try await retainedRoots.mergeRetainedRoots(scope: scope, roots: roots, operationID: operationID)
+    public func mergeRetainedRoots(scope: String, roots: [String]) async throws {
+        try await retainedRoots.mergeRetainedRoots(scope: scope, roots: roots)
     }
 
-    public func retainedRoots(scope: String) async -> [String] {
-        await retainedRoots.retainedRoots(scope: scope)
+    public func retainedRoots(scope: String) async throws -> [String] {
+        try await retainedRoots.retainedRoots(scope: scope)
     }
 
     // MARK: - Eviction

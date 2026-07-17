@@ -192,42 +192,68 @@ struct EvictionEngineTests {
         #expect(await h.pins.owners(root: root).isEmpty)
     }
 
-    @Test func cidInvalidVolumeCannotRetainStorage() async throws {
+    @Test func retainedIntentSurvivesContentLoss() async throws {
+        let h = try harness()
+        let retained = RetainedRootIndex(connection: h.connection)
+        let root = cid("lost")
+        try await h.store.storeVolumeLocal(volume("lost"))
+        try await retained.advanceRetainedRoots(scope: "canonical", roots: [root])
+        try await h.connection.write {
+            try h.connection.exec("DELETE FROM volume_metadata WHERE root='\(root)'")
+        }
+
+        #expect(await h.store.hasVolume(root: root) == false)
+        #expect(try await retained.retainedRoots(scope: "canonical") == [root])
+    }
+
+    @Test func quarantinedVolumeCannotBecomeNewRetentionRootButIntentSurvives() async throws {
         let h = try harness()
         let retained = RetainedRootIndex(connection: h.connection)
         let root = cid("corrupt")
         try await h.store.storeVolumeLocal(volume("corrupt"))
-        try await retained.advanceRetainedRoots(
-            scope: "canonical",
-            roots: [root],
-            operationID: "retain-valid"
-        )
+        try await retained.advanceRetainedRoots(scope: "canonical", roots: [root])
         try await h.connection.write {
             try h.connection.exec("UPDATE cas_data SET data=X'00' WHERE cid='\(root)'")
         }
+        #expect(await h.store.fetchVolumeLocal(root: root) == nil)
+        #expect(await casRowCount(connection: h.connection, cid: root) == 0)
 
         do {
-            try await retained.mergeRetainedRoots(
-                scope: "candidate",
-                roots: [root],
-                operationID: "retain-corrupt"
-            )
+            try await retained.mergeRetainedRoots(scope: "candidate", roots: [root])
             Issue.record("CID-invalid Volume must not become a retention root")
         } catch {
             #expect(error as? BrokerError == .missingRetainedRoot(root))
         }
-        #expect(await retained.retainedRoots(scope: "canonical").isEmpty)
-        #expect(await casRowCount(connection: h.connection, cid: root) == 0)
+        #expect(try await retained.retainedRoots(scope: "canonical") == [root])
+        #expect(try await retained.retainedRoots(scope: "candidate").isEmpty)
 
         try await h.store.storeVolumeLocal(volume("corrupt"))
-        try await retained.advanceRetainedRoots(
-            scope: "canonical",
-            roots: [root],
-            operationID: "retain-valid"
-        )
-        #expect(await retained.retainedRoots(scope: "canonical") == [root])
+        #expect(try await retained.retainedRoots(scope: "canonical") == [root])
         #expect(try await h.eviction.evictUnpinned(graceSeconds: 0) == 0)
         #expect(await h.store.hasVolume(root: root))
+    }
+
+    @Test func retainedRootReadPropagatesSQLFailure() async throws {
+        let h = try harness()
+        let retained = RetainedRootIndex(connection: h.connection)
+        #expect(sqlite3_set_authorizer(h.connection.readDb, { _, action, _, _, _, _ in
+            action == SQLITE_READ ? SQLITE_DENY : SQLITE_OK
+        }, nil) == SQLITE_OK)
+        defer { sqlite3_set_authorizer(h.connection.readDb, nil, nil) }
+
+        do {
+            _ = try await retained.retainedRoots(scope: "canonical")
+            Issue.record("retained-root SQL failures must propagate")
+        } catch {
+            guard let brokerError = error as? BrokerError else {
+                Issue.record("unexpected error: \(error)")
+                return
+            }
+            guard case .sqlFailed = brokerError else {
+                Issue.record("unexpected broker error: \(brokerError)")
+                return
+            }
+        }
     }
 
     @Test func quarantineSQLFailureNeverDeletesContent() async throws {

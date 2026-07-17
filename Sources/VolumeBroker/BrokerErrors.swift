@@ -7,9 +7,8 @@ public enum BrokerError: Error, Sendable, Equatable {
     case notFound
     case invalidPinCount
     case invalidPinTTL
-    case invalidRetainedRootOperation(String)
+    case invalidRetainedRoots(String)
     case missingRetainedRoot(String)
-    case conflictingRetainedRootOperation(String)
 
     /// Existing CAS bytes for a CID differ from the bytes being stored. Under
     /// content addressing this is corruption (or an impossible hash collision),

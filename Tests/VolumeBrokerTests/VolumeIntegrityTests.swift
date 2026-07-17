@@ -98,6 +98,34 @@ final class VolumeIntegrityTests: XCTestCase {
         }
     }
 
+    func testNonidentityCIDAliasIsRejected() throws {
+        let data = Data("nonidentity-alias".utf8)
+        let multihash = try Multihash(raw: data, hashedWith: .sha2_256)
+        let cid = try CID(version: .v1, codec: .dag_cbor, multihash: multihash)
+        let alias = cid.toBaseEncodedString.uppercased()
+
+        XCTAssertNotEqual(alias, cid.toBaseEncodedString)
+        XCTAssertThrowsError(
+            try SerializedVolume(root: alias, entries: [alias: data]).validate()
+        ) { error in
+            XCTAssertEqual(error as? SerializedVolumeError, .invalidCID(alias))
+        }
+    }
+
+    func testIdentityCIDAliasIsRejected() throws {
+        let data = Data("identity-alias".utf8)
+        let multihash = try Multihash(raw: data, hashedWith: .identity)
+        let cid = try CID(version: .v1, codec: .dag_cbor, multihash: multihash)
+        let alias = cid.toBaseEncodedString.uppercased()
+
+        XCTAssertNotEqual(alias, cid.toBaseEncodedString)
+        XCTAssertThrowsError(
+            try SerializedVolume(root: alias, entries: [alias: data]).validate()
+        ) { error in
+            XCTAssertEqual(error as? SerializedVolumeError, .invalidCID(alias))
+        }
+    }
+
     func testZeroLengthDigestFailsClosed() throws {
         let data = Data("zero".utf8)
         let root = try cid(for: data, digestLength: 0)

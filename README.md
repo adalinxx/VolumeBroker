@@ -69,13 +69,14 @@ try await disk.unpin(root: rootCID, owner: "sync:42")
 ```swift
 try await disk.advanceRetainedRoots(
     scope: "state:canonical",
-    roots: materializedVolumeRoots,
-    operationID: transitionID
+    roots: materializedVolumeRoots
 )
 ```
 
-Replaying the same operation is a no-op; reusing its ID with another payload
-fails. `mergeRetainedRoots` adds roots without replacing the set.
+Replacing a scope with the same root set is naturally idempotent, as is merging
+roots already in the set. `mergeRetainedRoots` adds roots without replacing the
+set. The node or application owns operation ordering, transition identity, and
+replay policy.
 
 ```swift
 let evicted = try await disk.evictUnpinned()

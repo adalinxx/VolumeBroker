@@ -73,7 +73,6 @@ struct ContentStoreTests {
         let rootCID = try await store.put(dict)
 
         #expect(await store.has(rootCID))
-        #expect(await store.hasDurable(rootCID))
 
         let got = try await store.getRecursive(Dict.self, rootCID)
         #expect(try got?.get(key: "alice") == "v1")

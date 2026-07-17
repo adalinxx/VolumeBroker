@@ -262,33 +262,25 @@ struct MemoryBrokerTests {
         try await broker.storeVolumeLocal(payload("keep"))
         try await broker.storeVolumeLocal(payload("drop"))
 
-        try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [keep], operationID: "op-1")
+        try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [keep])
 
         #expect(await broker.owners(root: keep).isEmpty)
-        #expect(await broker.retainedRoots(scope: "chain-a:state") == [keep])
+        #expect(try await broker.retainedRoots(scope: "chain-a:state") == [keep])
         let evicted = try await broker.evictUnpinned()
         #expect(evicted == 1)
         #expect(await broker.hasVolume(root: keep))
         #expect(await broker.hasVolume(root: drop) == false)
     }
 
-    @Test func retainedRootOperationIDIsPayloadBound() async throws {
+    @Test func retainedRootReplaceIsNaturallyIdempotent() async throws {
         let broker = MemoryBroker(evictUnpinnedGrace: .zero)
         let r1 = cid("r1")
-        let r2 = cid("r2")
         try await broker.storeVolumeLocal(payload("r1"))
-        try await broker.storeVolumeLocal(payload("r2"))
 
-        try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [r1], operationID: "op-1")
-        try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [r1], operationID: "op-1")
+        try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [r1])
+        try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [r1])
 
-        do {
-            try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [r2], operationID: "op-1")
-            #expect(Bool(false), "operation id replay with a different payload must fail")
-        } catch BrokerError.conflictingRetainedRootOperation(let operationID) {
-            #expect(operationID == "op-1")
-        }
-        #expect(await broker.retainedRoots(scope: "chain-a:state") == [r1])
+        #expect(try await broker.retainedRoots(scope: "chain-a:state") == [r1])
     }
 
     @Test func retainedRootMergeAddsWithoutReplacingScope() async throws {
@@ -300,11 +292,11 @@ struct MemoryBrokerTests {
         try await broker.storeVolumeLocal(payload("new"))
         try await broker.storeVolumeLocal(payload("drop"))
 
-        try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [old], operationID: "op-1")
-        try await broker.mergeRetainedRoots(scope: "chain-a:state", roots: [new], operationID: "op-2")
-        try await broker.mergeRetainedRoots(scope: "chain-a:state", roots: [new], operationID: "op-2")
+        try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [old])
+        try await broker.mergeRetainedRoots(scope: "chain-a:state", roots: [new])
+        try await broker.mergeRetainedRoots(scope: "chain-a:state", roots: [new])
 
-        #expect(Set(await broker.retainedRoots(scope: "chain-a:state")) == [new, old])
+        #expect(Set(try await broker.retainedRoots(scope: "chain-a:state")) == [new, old])
         let evicted = try await broker.evictUnpinned()
         #expect(evicted == 1)
         #expect(await broker.hasVolume(root: old))
@@ -312,40 +304,14 @@ struct MemoryBrokerTests {
         #expect(await broker.hasVolume(root: drop) == false)
     }
 
-    @Test func retainedRootMergeOperationIDIsPayloadAndKindBound() async throws {
-        let broker = MemoryBroker(evictUnpinnedGrace: .zero)
-        let r1 = cid("r1")
-        let r2 = cid("r2")
-        try await broker.storeVolumeLocal(payload("r1"))
-        try await broker.storeVolumeLocal(payload("r2"))
-
-        try await broker.mergeRetainedRoots(scope: "chain-a:state", roots: [r1], operationID: "op-1")
-
-        do {
-            try await broker.mergeRetainedRoots(scope: "chain-a:state", roots: [r2], operationID: "op-1")
-            #expect(Bool(false), "operation id replay with a different payload must fail")
-        } catch BrokerError.conflictingRetainedRootOperation(let operationID) {
-            #expect(operationID == "op-1")
-        }
-
-        do {
-            try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [r1], operationID: "op-1")
-            #expect(Bool(false), "operation id replay with a different operation kind must fail")
-        } catch BrokerError.conflictingRetainedRootOperation(let operationID) {
-            #expect(operationID == "op-1")
-        }
-
-        #expect(await broker.retainedRoots(scope: "chain-a:state") == [r1])
-    }
-
     @Test func retainedRootDoesNotRequireRelatedVolume() async throws {
         let broker = MemoryBroker(evictUnpinnedGrace: .zero)
         let root = cid("root")
         try await broker.storeVolumeLocal(payload("root"))
 
-        try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [root], operationID: "op-1")
+        try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [root])
 
-        #expect(await broker.retainedRoots(scope: "chain-a:state") == [root])
+        #expect(try await broker.retainedRoots(scope: "chain-a:state") == [root])
     }
 
     @Test func evictUnpinnedRespectsStoreThenPinGrace() async throws {
