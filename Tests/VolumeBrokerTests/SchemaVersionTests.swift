@@ -31,6 +31,7 @@ struct SchemaVersionTests {
             throw TestDatabaseError.sqlite(message)
         }
         defer { sqlite3_close(db) }
+        sqlite3_busy_timeout(db, 5_000)
         return try body(db)
     }
 
@@ -68,19 +69,15 @@ struct SchemaVersionTests {
         return try CID(version: .v1, codec: .dag_cbor, multihash: multihash).toBaseEncodedString
     }
 
-    private func initializeAndStore(path: String, root: String, data: Data) async throws -> Bool {
-        let broker = try DiskBroker(path: path)
-        try await broker.storeVolumeLocal(SerializedVolume(root: root, entries: [root: data]))
-        return await broker.hasVolume(root: root)
-    }
-
     @Test func freshDatabaseInitializesV1AndReopens() async throws {
         let location = try temporaryDatabase()
         defer { try? FileManager.default.removeItem(at: location.directory) }
         let data = Data("root".utf8)
         let root = try cid(for: data)
 
-        #expect(try await initializeAndStore(path: location.path, root: root, data: data))
+        let broker = try DiskBroker(path: location.path)
+        try await broker.storeVolumeLocal(SerializedVolume(root: root, entries: [root: data]))
+        #expect(await broker.hasVolume(root: root))
 
         try withDatabase(at: location.path) { db in
             let version = try scalar(db, "PRAGMA user_version")
@@ -89,6 +86,7 @@ struct SchemaVersionTests {
 
         let reopened = try DiskBroker(path: location.path)
         #expect(await reopened.fetchVolumeLocal(root: root)?.entries == [root: data])
+        #expect(await broker.hasVolume(root: root))
     }
 
     @Test func equivalentWhitespaceV1MetadataSchemaReopens() throws {
