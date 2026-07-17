@@ -1,31 +1,67 @@
 # VolumeBroker
 
-Volume-granular content-addressed storage for [cashew](https://github.com/adalinxx/cashew) Merkle DAGs. Replaces per-CID storage with atomic serialized Volumes, an owner-based pin ledger, and tiered fetch cascading.
+Atomic, Volume-granular content-addressed storage for
+[cashew](https://github.com/adalinxx/cashew).
 
-## Why
+A `SerializedVolume` names one root CID and the exact `(CID, bytes)` entries
+published with that root. VolumeBroker validates and publishes that set as one
+unit. It does not follow links, infer child Volumes, or turn one retained root
+into a transitive DAG pin.
 
-In a Merkle DAG where every subtree boundary is a [Volume](https://github.com/adalinxx/cashew), the natural unit of storage, pinning, and eviction is the Volume — not the individual CID. VolumeBroker provides:
+That separation is the point:
 
-- **Atomic writes** — a Volume's CIDs are committed as one transaction
-- **Ref-counted pinning** — multiple owners (chains, processes) can independently pin the same Volume root; multiple pins to the same (root, owner) pair are additive, and unpin decrements the count. Data is evictable only when all pin counts reach zero.
-- **TTL pins** — owners can pin with an expiration; expired owners are pruned automatically during eviction sweeps
-- **Domain-local CAS dedup** — CIDs shared by Volumes in one broker domain are stored once
-- **Tiered fetch cascade** — memory → disk → network, configurable via `near`/`far` links
+- Cashew decides which DAG boundaries to materialize.
+- VolumeBroker stores each selected Volume independently.
+- The caller decides where to store it and how long to retain it.
 
-## Package layout
+## Mental model
 
+```text
+Cashew storage plan
+        |
+        v
+complete SerializedVolume(s)
+        |
+        v
+MemoryBroker or DiskBroker  <---- explicit store target
+        |
+        +---- local -> near -> far fetch cascade
+        |
+        +---- pins / retained-root sets -> eviction protection
 ```
-Sources/VolumeBroker/
-  VolumeBroker.swift     Protocol — the core abstraction
-  SerializedVolume.swift    {root, entries: [cid: data]}
-  MemoryBroker.swift     In-memory LRU with capacity cap
-  DiskBroker.swift       SQLite-backed durable storage
-  BrokerFetcher.swift    cashew ContentSource (+ Fetcher) adapter
-  BrokerStorer.swift     cashew VolumeStorer adapter
-  BrokerErrors.swift     Shared error types
-```
 
-## Protocol
+One broker cascade is one storage domain. Its local, `near`, and `far` tiers may
+share content, but they do not represent parent and child chains. A host that
+needs isolation creates a separate broker or database path for each domain.
+
+## Contract
+
+| Rule | Meaning |
+| --- | --- |
+| Complete publication | A Volume becomes visible only when its root, membership, and every entry are present and valid. |
+| Atomic batches | `storeVolumesLocal(_:)` publishes the whole validated batch or none of it. |
+| Immutable content | A CID cannot acquire different bytes, and a Volume root cannot acquire different membership. |
+| Explicit storage | Writes go only to the broker the caller selected. There is no write cascade. |
+| Tiered reads | `fetchVolume(root:)` and `fetchData(cid:)` try local, then `near`, then `far`. |
+| Explicit retention | Pins and retained-root sets protect named Volume roots only. Related roots must be named separately. |
+| Local CAS deduplication | Equal CIDs are stored once within each broker tier and released after their last owning Volume there. |
+
+Loose CAS rows are never storage truth. A CID is readable only through at least
+one complete, valid, published Volume that contains it.
+
+## API surfaces
+
+Use the highest-level surface that fits the caller:
+
+| Surface | Use it for |
+| --- | --- |
+| `ContentStore` | Storing and resolving Cashew `Node` values by root CID. |
+| `BrokerStorer` / `BrokerFetcher` | Connecting Cashew's storage and resolution plans to a broker. |
+| `VolumeBroker` | Direct Volume publication, fetch cascading, pins, and eviction. |
+| `RetainedRootBroker` | Atomically replacing a named retained-root set. |
+| `RetainedRootMergeBroker` | Idempotently adding roots to a named retained-root set. |
+
+The core protocol is intentionally small:
 
 ```swift
 public protocol VolumeBroker: AnyObject, Sendable {
@@ -45,111 +81,149 @@ public protocol VolumeBroker: AnyObject, Sendable {
 }
 ```
 
-**Fetch cascade** (provided by default extension): `fetchVolume(root:)` and `fetchData(cid:)` each try local, then `near`, then `far`. Those tiers belong to the same storage domain; they are not parent/child chain links. The protocol also ships a volume-keyed fallback for `fetchDataLocal(cid:)`, `storeVolumeLocal(_:)` as a one-item batch, and convenience `pin`/`unpin` overloads. Every broker must implement atomic `storeVolumesLocal(_:)` itself.
-
-**Stores are explicit** — no default cascade. The caller decides which tier to write to (`storeVolumeLocal` on the target broker).
-
-**Content-addressed by CID** — `fetchData(cid:)` resolves a node only when at least one complete published Volume owns that CID. Loose orphan CAS rows are never visible. `fetchVolume(root:)` returns the complete Volume's entries for boundary-grain serving. Volume relationships remain encoded in the application's content-addressed structures; the broker stores and retains each Volume independently.
-
-One broker instance is one storage domain. Its private CAS deduplicates only the
-complete Volumes explicitly published to that broker. A node that requires
-chain isolation uses a separate broker/path per chain; loose opportunistic
-blocks belong in a bounded chain-local transient store, not VolumeBroker.
-Pins likewise apply only to complete Volumes already published in that broker;
-they cannot create ownership for an arbitrary CID. Chain metadata and canonical
-tip records belong to the node, not the storage broker.
-
-A bounded `MemoryBroker` rejects a store with `BrokerError.capacityExceeded`
-when the submitted Volumes and already-protected Volumes cannot fit together;
-it never reports success after retaining only part of the submitted batch.
+`storeVolumeLocal(_:)`, the read-cascade methods, and common pin/unpin overloads
+are protocol extensions. Every implementation supplies its own atomic batch
+store.
 
 ## Usage
 
-### Wiring the cascade
+### Build a read cascade
 
 ```swift
-let memory = MemoryBroker(capacity: 10_000)
-let disk = try DiskBroker(path: "/path/to/volumes.sqlite")
+import VolumeBroker
 
-// Fetch: memory → disk (near/far are settable properties)
+let memory = MemoryBroker(byteBudget: 64 * 1024 * 1024)
+let disk = try DiskBroker(path: "/var/lib/my-app/volumes.sqlite")
+
 memory.near = disk
 ```
 
-### Storing and pinning
+`memory.fetchData(cid:)` now checks memory and then disk. Stores remain explicit:
+write to `disk` for durability or to `memory` for transient residency.
+
+### Publish from Cashew
+
+Let Cashew produce valid Volume boundaries instead of constructing placeholder
+CIDs by hand:
 
 ```swift
-let volume = SerializedVolume(root: "Qm...", entries: ["Qm...": serializedData])
-
-// Durable write to disk
-try await disk.storeVolumeLocal(volume)
-
-// Pin an already-stored Volume; nil TTL = indefinite, count must be positive
-try await disk.pin(root: "Qm...", owner: "chain-abc:tip", count: 1)
-
-// Pin again — counts are additive (now count = 2)
-try await disk.pin(root: "Qm...", owner: "chain-abc:tip", count: 1)
-
-// Pin with TTL (auto-expires)
-try await disk.pin(root: "Qm...", owner: "chain-abc:42", count: 1, ttl: .seconds(3600))
-```
-
-### Eviction
-
-```swift
-// Decrement pin count for a specific owner (row deleted when count reaches zero)
-try await disk.unpin(root: "Qm...", owner: "chain-abc:42", count: 1)
-
-// Remove all pins for an owner across every root
-try await disk.unpinAll(owner: "chain-abc:42")
-
-// Sweep: prune expired owners, then evict Volumes with zero remaining pins
-let evicted = try await disk.evictUnpinned()
-```
-
-### cashew integration
-
-```swift
-// Storing a Merkle tree
 let storer = BrokerStorer(broker: disk)
-try await root.storeRecursively(storer: storer)
 
-// Or store the root plus selected nested Volumes
-try await root.store(paths: [["accounts/alice"]: .targeted], storer: storer)
-
-// Resolving a Merkle tree
-let fetcher = BrokerFetcher(broker: memory)  // ContentSource/Fetcher; uses fetch cascade
-let resolved = try await root.resolveRecursive(fetcher: fetcher)
+// The root Volume is always selected. This also selects one nested boundary.
+try await root.store(
+    paths: [["accounts", "alice"]: .targeted],
+    storer: storer
+)
 ```
 
-## DiskBroker schema
+Use `.recursive` when the storage plan should select every nested Volume below a
+path. Each emitted Volume is still a separate publication and retention unit.
 
-SQLite tables with WAL journaling:
+For object-level calls:
 
-| Table | Purpose |
-|---|---|
-| `cas_data(cid, data)` | Content-addressed blobs deduplicated within this broker domain |
-| `volume_entries(root, cid)` | Membership index: which CIDs are stored inside each complete Volume |
-| `volume_pins(root, owner, count, expires_at)` | Ref-counted pins for stored Volumes; positive integer count and optional TTL |
-| `volume_unpin_operations(operation_id)` | Idempotency ledger for `unpinBatchOnce` |
-| `volume_metadata(root, entry_count, stored_at)` | Complete-manifest and lifecycle tracking |
-| `retained_roots(scope, root)` | Named durable retained-root sets (independent of owner/count pins) |
-| `retained_root_operations(operation_id, scope, canonical_roots)` | Idempotency ledger for retained-root advance/merge |
+```swift
+let objects = ContentStore(broker: disk)
+let rootCID = try await objects.put(state)
+let loaded = try await objects.getRecursive(State.self, rootCID)
+```
 
-The schema is versioned with `PRAGMA user_version=1` and enables foreign-key enforcement. Concurrent first opens serialize initialization. Reopened databases must match the canonical tables and indexes exactly; nonempty v0, malformed v1, and unsupported future versions fail closed without migration.
+### Resolve through the cascade
 
-Eviction is a single transaction: prune expired pins, delete membership and
-metadata for unprotected Volumes older than the grace window
-(`evictUnpinnedGraceSeconds`, default 600), then delete CAS rows with no
-remaining membership owner. A live pin or retained root protects that Volume
-and its direct entries; related Volume roots must be protected explicitly.
-Eviction never decrements pin counts; that happens only in `unpin`/`unpinAll`.
-Reads revalidate content addresses and transactionally quarantine a discovered
-corrupt Volume. Retention intent remains so repairing the same Volume restores
-protection; ordinary eviction does not rehash every retained payload.
+```swift
+let source = BrokerFetcher(broker: memory)
+let resolved = try await unresolvedRoot.resolveRecursive(source: source)
+```
 
-## Requirements
+`BrokerFetcher` serves a CID only when a complete Volume in the cascade owns it.
 
+### Retain and release
+
+Pins are additive per `(root, owner)`. A pin requires an already-published local
+Volume.
+
+```swift
+try await disk.pin(root: rootCID, owner: "sync:session-42")
+try await disk.pin(
+    root: rootCID,
+    owner: "cache:recent",
+    ttl: .seconds(3_600)
+)
+
+try await disk.unpin(root: rootCID, owner: "sync:session-42")
+try await disk.unpinAll(owner: "cache:recent")
+```
+
+On `DiskBroker`, named retained-root sets durably advance policy as one
+idempotent operation:
+
+```swift
+try await disk.advanceRetainedRoots(
+    scope: "state:canonical",
+    roots: materializedVolumeRoots,
+    operationID: transitionID
+)
+```
+
+Replaying the same operation ID and payload is a no-op. Reusing an operation ID
+for different roots fails. `mergeRetainedRoots` adds roots without replacing the
+scope. Pins and retained-root sets are independent mechanisms; both protect only
+the roots explicitly named.
+
+### Evict
+
+```swift
+let evictedVolumeCount = try await disk.evictUnpinned()
+```
+
+An eviction sweep prunes expired pins, removes unprotected Volumes older than the
+grace window, then removes CAS rows with no remaining Volume owner. Shared bytes
+survive until the last owning Volume is removed.
+
+`MemoryBroker` can be bounded by Volume count or unique resident bytes. A store
+that cannot fit alongside already-protected Volumes fails with
+`BrokerError.capacityExceeded`; it never reports success after keeping only part
+of the submitted batch.
+
+## Disk durability
+
+`DiskBroker` uses SQLite with WAL journaling and foreign-key enforcement.
+
+| Table | Durable fact |
+| --- | --- |
+| `cas_data` | CID-addressed bytes deduplicated in this broker domain. |
+| `volume_metadata` | Published root, declared entry count, and publication time. |
+| `volume_entries` | Exact membership of each published Volume. |
+| `volume_pins` | Owner/count pins and optional expiration. |
+| `volume_unpin_operations` | Idempotency records for counted batch release. |
+| `retained_roots` | Named retained-root sets. |
+| `retained_root_operations` | Payload-bound idempotency records for retained-root updates. |
+
+Schema v1 is validated on every open. Empty v0 databases initialize atomically;
+nonempty v0, malformed v1, and unsupported future schemas fail closed without
+automatic migration. Reads revalidate complete Volumes and transactionally
+quarantine discovered corruption without deleting named retained-root intent.
+
+## Boundary
+
+| VolumeBroker owns | The caller owns |
+| --- | --- |
+| Volume validation and atomic publication | DAG traversal and storage-plan selection |
+| Local CAS deduplication | Storage-domain and chain isolation |
+| Read cascading | Write placement and network retrieval policy |
+| Pins, retained-root sets, and eviction | Which materialized roots current policy retains |
+| Storage integrity | Canonicity, consensus, and application metadata |
+
+Chain tips, child-chain records, block retention counters, and opportunistic
+unvalidated bytes do not belong in VolumeBroker.
+
+## Correctness and verification
+
+- [Correctness invariants](docs/correctness-invariants.md)
 - Swift 6.0+
-- macOS 13+ / iOS 16+
-- [cashew](https://github.com/adalinxx/cashew) 4.0.1+
-- [ArrayTrie](https://github.com/adalinxx/ArrayTrie) 1.0.0+
+- macOS 13+ or iOS 16+
+- Cashew 4.0.1+
+
+```sh
+swift build
+swift test
+```

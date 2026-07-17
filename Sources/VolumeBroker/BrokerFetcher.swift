@@ -2,7 +2,7 @@ import Foundation
 import cashew
 
 /// Bridges a `VolumeBroker` tier chain to cashew resolution as a batched
-/// `ContentSource` (and a per-CID `Fetcher` for legacy callers).
+/// `ContentSource` and per-CID `Fetcher`.
 ///
 /// `CoalescingFetcher` batches each resolution wave, so this adapter
 /// answers content lookups against the broker chain via `fetchData(cid:)`
@@ -26,7 +26,7 @@ public actor BrokerFetcher: ContentSource, Fetcher {
         return out
     }
 
-    /// Per-CID (legacy `Fetcher`).
+    /// Per-CID `Fetcher` adapter.
     public func fetch(rawCid: String) async throws -> Data {
         guard let data = await broker.fetchData(cid: rawCid) else { throw BrokerError.notFound }
         return data

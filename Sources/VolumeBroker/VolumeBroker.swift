@@ -21,9 +21,9 @@ public protocol VolumeBroker: AnyObject, Sendable {
     func evictUnpinned() async throws -> Int
 }
 
-/// Optional durable-retention surface for brokers that can advance a named set
-/// of roots atomically. Retained roots are independent from owner/count pins and
-/// protect the same per-Volume entries from serving and eviction.
+/// Optional retention surface for brokers that can atomically advance a named
+/// set of roots. Retained roots are independent from owner/count pins and
+/// protect the named Volumes from eviction.
 public protocol RetainedRootBroker: VolumeBroker {
     func advanceRetainedRoots(scope: String, roots: [String], operationID: String) async throws
     func retainedRoots(scope: String) async -> [String]
@@ -68,7 +68,7 @@ public extension VolumeBroker {
         await fetchVolumeLocal(root: cid)?.entries[cid]
     }
 
-    /// Content-by-CID across the tier chain (memory → disk → network).
+    /// Content-by-CID across the tier chain (memory -> disk -> network).
     func fetchData(cid: String) async -> Data? {
         if let local = await fetchDataLocal(cid: cid) { return local }
         if let near, let data = await near.fetchData(cid: cid) { return data }

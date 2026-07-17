@@ -1,55 +1,112 @@
 # Correctness invariants
 
-## VOLUME-001 — a stored Volume includes its root
+These are the laws a `VolumeBroker` implementation must preserve. "Published"
+means the Volume is available to `hasVolume`, whole-Volume fetch, and per-CID
+fetch. Retention never substitutes for publication.
 
-A declared root missing from the entry set is rejected before storage.
+## VOLUME-001: the root is an entry
 
-## VOLUME-002 — every entry is content-address correct
+A stored Volume contains bytes for its declared root CID. Missing roots are
+rejected before mutation.
 
-The broker recomputes each CID using its declared version, codec, and multihash algorithm. CIDv0 is accepted only in its canonical dag-pb, 32-byte SHA-256 form. A mismatch is rejected before storage and durable reads revalidate the returned Volume.
+## VOLUME-002: every entry authenticates itself
 
-## VOLUME-003 — one malformed Volume aborts the batch
+The broker recomputes each CID using its declared version, codec, multihash
+algorithm, and digest length. CIDv0 is accepted only in canonical dag-pb,
+32-byte SHA-256 form. Writes and durable reads fail closed on mismatch.
 
-All Volumes are validated and copied before a MemoryBroker mutation or SQLite transaction begins. A successful store owns an immutable snapshot of the submitted bytes.
+## VOLUME-003: publication owns an atomic snapshot
 
-## VOLUME-004 — immutable CID bytes cannot conflict
+Every Volume is validated and copied before a memory mutation or SQLite
+transaction begins. One malformed Volume aborts the whole batch, and later
+caller mutation cannot change published bytes.
 
-An existing CID row must be byte-identical. Conflicting bytes are surfaced as corruption rather than hidden by `INSERT OR IGNORE`.
+## VOLUME-004: CID bytes are immutable
 
-## VOLUME-005 — published Volume membership is immutable
+If a CID already exists in the broker domain, a new publication must provide
+byte-identical content. A conflict is corruption, not an overwrite.
 
-Re-storing a Volume root must provide the same complete entry set. MemoryBroker and DiskBroker reject conflicting memberships before mutating storage.
+## VOLUME-005: Volume membership is immutable
 
-## VOLUME-006 — incomplete manifests are unavailable
+If a root is already published, republishing it must name the same exact entry
+set. Both memory and disk brokers reject conflicting membership before mutation.
 
-Presence, whole-Volume fetch, and per-CID fetch share one completeness predicate: declared entry count, membership count, owned CAS count, and root membership must all agree.
+## VOLUME-006: incomplete Volumes are unavailable
 
-## VOLUME-007 — incomplete traversal is not publishable
+Presence and fetch agree on one completeness law: the declared entry count,
+membership count, owned CAS count, and root membership all match. No partial
+Volume is published.
 
-Cashew fully serializes a selected Volume boundary before invoking `VolumeStorer`. A missing or unserializable ordinary Header prevents that Volume from reaching the broker.
+## VOLUME-007: a selected boundary is complete
 
-## VOLUME-008 — loose CAS rows are not storage truth
+Cashew serializes an entire selected Volume before calling `VolumeStorer`. A
+missing or unserializable ordinary Header prevents that boundary from reaching
+the broker.
 
-A CID is readable only through at least one complete, CID-valid owning Volume. Dangling memberships, pins, and corrupt Volumes own nothing. A read that discovers corruption transactionally quarantines that Volume without mistaking a SQLite error for corruption; ordinary eviction removes structurally unowned CAS bytes without rehashing the entire database.
+## VOLUME-008: loose CAS rows own nothing
 
-## VOLUME-009 — schema startup fails closed
+A CID is readable only through a complete, CID-valid owning Volume. Dangling
+memberships, pins, malformed metadata, and corrupt Volumes grant no visibility
+or eviction ownership. A read that proves corruption quarantines that Volume in
+one transaction; a database error is not treated as proof of corruption.
 
-Fresh empty v0 databases initialize at schema v1 under one initialization transaction. Reopened v1 databases must match the canonical tables and indexes, including types, defaults, checks, keys, and foreign keys, and must not attach extra schema behavior to owned tables. Nonempty v0, malformed v1, and unsupported future versions fail closed.
+## VOLUME-009: retention names published local roots
 
-## VOLUME-010 — a broker is one storage domain
+Pins and retained-root updates accept only complete Volumes already published
+in the same broker domain. A retained root protects that Volume and its direct
+entries; it does not discover or protect linked Volume roots.
 
-The local, near, and far tiers of a broker hold complete Volumes for one storage domain. Parent/child chain synchronization uses separate brokers under node policy.
+Pin counts are positive additive integers. Overflow and nonpositive operations
+fail without mutation. Expired pins are not live.
 
-## VOLUME-011 — successful memory publication fits as a whole
+## VOLUME-010: retention operations are replay-safe
 
-A bounded MemoryBroker rejects a batch before mutation when the submitted Volumes and already-protected Volumes cannot coexist within its count or byte limit. Publication and limit enforcement share one critical section.
+An idempotent operation ID is bound to its operation kind, scope, and canonical
+payload. Replaying the same operation is a no-op; reusing the ID for a different
+operation fails.
 
-## VOLUME-012 — pins retain only published local Volumes
+A retained-root intent may outlive quarantined bytes. Republishing the same
+valid Volume restores protection without replaying stale policy transitions.
 
-A pin is accepted only for a complete Volume already published in the same broker domain. Pin and unpin counts are positive, additive integers; overflow and nonpositive operations fail without mutation. A retained-root intent may outlive quarantined bytes so repairing that same Volume restores the current policy without replaying stale state transitions.
+## VOLUME-011: successful bounded-memory publication fits as a whole
 
-## VOLUME-013 — storage has no chain-control side channel
+A bounded `MemoryBroker` rejects a batch before mutation when the submitted
+Volumes and already-protected Volumes cannot coexist within its count or byte
+limit. Publication and capacity enforcement share one critical section.
 
-VolumeBroker stores Volumes and their retention policy only. Canonical tips, child-chain records, and other chain metadata belong to the node and cannot bypass the Volume contract through a broker key/value table.
+## VOLUME-012: eviction follows explicit ownership
 
-Established by: `VolumeIntegrityTests`, `SchemaVersionTests`, `PinIndexTests`, `EvictionEngineTests`, and the companion cashew storage-plan tests.
+A live pin or retained-root entry protects only its named Volume. Shared CAS
+bytes remain while any published Volume owns them and disappear only after the
+last owner is removed. Eviction never decrements a pin count.
+
+## VOLUME-013: a broker cascade is one storage domain
+
+Local, `near`, and `far` are read tiers in one domain. Reads may fall through
+the cascade; writes never do. Cross-domain or cross-chain synchronization uses
+separate brokers under caller policy.
+
+## VOLUME-014: schema startup fails closed
+
+Fresh empty v0 databases initialize schema v1 in one transaction. Reopened v1
+databases must match canonical tables and indexes, including keys, checks,
+defaults, and foreign keys, and cannot attach behavior to broker-owned tables.
+Nonempty v0, malformed v1, and unsupported future versions are not mutated.
+
+## VOLUME-015: storage has no chain-control side channel
+
+VolumeBroker stores complete Volumes and explicit retention policy. Canonical
+tips, chain relationships, consensus state, and application metadata cannot
+bypass the Volume contract through broker-owned storage.
+
+## Verification map
+
+| Area | Primary coverage |
+| --- | --- |
+| Content and membership integrity | `VolumeIntegrityTests`, `BrokerStorerTests` |
+| Atomic memory publication and limits | `MemoryBrokerTests` |
+| Pins and replay-safe release | `PinIndexTests`, `DiskBrokerTests` |
+| Retained-root transitions | `MemoryBrokerTests`, `DiskBrokerTests` |
+| Eviction and corruption quarantine | `EvictionEngineTests` |
+| Schema identity and startup | `SchemaVersionTests` |
+| Cashew boundary selection | Cashew `StoragePlanTests`, VolumeBroker `ContentStoreTests` |

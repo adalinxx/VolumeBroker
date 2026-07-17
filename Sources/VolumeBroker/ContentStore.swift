@@ -2,9 +2,8 @@ import Foundation
 import ArrayTrie
 import cashew
 
-/// Object-level façade over a `VolumeBroker` tier chain: lattice-node deals in
-/// whole content **objects by root CID** and never touches `SerializedVolume`,
-/// individual entries, or cashew fetch/resolution mechanics directly.
+/// Object-level facade over a `VolumeBroker` tier chain for callers that deal in
+/// whole content objects by root CID rather than serialized Volume entries.
 public actor ContentStore {
     private let broker: any VolumeBroker
     private let source: BrokerFetcher
