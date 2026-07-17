@@ -77,6 +77,24 @@ struct SchemaVersionTests {
         #expect(await reopened.fetchVolumeLocal(root: root)?.entries == [root: data])
     }
 
+    @Test func originalV1MetadataSchemaReopens() throws {
+        let location = try temporaryDatabase()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        _ = try DiskBroker(path: location.path)
+        try withDatabase(at: location.path) { db in
+            try execute(db, "DROP TABLE volume_metadata")
+            try execute(db, """
+                CREATE TABLE volume_metadata (
+                    root TEXT PRIMARY KEY,
+                    entry_count INTEGER NOT NULL CHECK (entry_count > 0),
+                    stored_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+                """)
+        }
+
+        _ = try DiskBroker(path: location.path)
+    }
+
     @Test func foreignKeysAreEnabledOnBothConnections() throws {
         let location = try temporaryDatabase()
         defer { try? FileManager.default.removeItem(at: location.directory) }
@@ -240,6 +258,27 @@ struct SchemaVersionTests {
         try withDatabase(at: location.path) { db in
             let preservedRows = try scalar(db, "SELECT COUNT(*) FROM volume_edges WHERE marker='keep'")
             #expect(preservedRows == 1)
+        }
+    }
+
+    @Test(arguments: ["CASCADE", "RESTRICT"])
+    func incomingForeignKeyToOwnedTableIsRejected(action: String) throws {
+        let location = try temporaryDatabase()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        _ = try DiskBroker(path: location.path)
+        try withDatabase(at: location.path) { db in
+            try execute(db, """
+                CREATE TABLE external_volume_reference (
+                    root TEXT REFERENCES volume_metadata(root) ON DELETE \(action)
+                )
+                """)
+        }
+
+        do {
+            _ = try DiskBroker(path: location.path)
+            Issue.record("incoming foreign keys must not attach behavior to owned tables")
+        } catch {
+            #expect(error as? BrokerError == .invalidSchema(version: 1))
         }
     }
 }

@@ -282,6 +282,17 @@ final class SQLiteConnection: @unchecked Sendable {
               AND name NOT IN (\(allowedIndexes))
             """
         ) == 0,
+        try scalarInt(
+            db: db,
+            """
+            SELECT COUNT(*)
+            FROM sqlite_schema AS child
+            JOIN pragma_foreign_key_list(child.name) AS fk
+            WHERE child.type='table'
+              AND child.name NOT IN (\(protectedTables))
+              AND fk."table" COLLATE NOCASE IN (\(protectedTables))
+            """
+        ) == 0,
         try scalarInt(db: db, "SELECT COUNT(*) FROM pragma_foreign_key_check") == 0 else {
             throw BrokerError.invalidSchema(version: schemaVersion)
         }

@@ -2,6 +2,11 @@ import Testing
 import Foundation
 import CID
 import Multihash
+#if canImport(SQLite3)
+import SQLite3
+#else
+import VolumeBrokerSQLite
+#endif
 @testable import VolumeBroker
 
 /// Independent unit tests for the `PinIndex` collaborator.
@@ -77,16 +82,35 @@ struct PinIndexTests {
         #expect(await h.pins.owners(root: root) == ["owner-a"])
     }
 
-    @Test func fractionalTTLDoesNotExpireImmediately() async throws {
+    @Test func fractionalTTLIsPersisted() async throws {
         let h = try await tempIndex()
         let root = try #require(h.roots["r1"])
+        let before = Date.now
         try await h.pins.pin(
             root: root,
             owner: "owner-a",
             count: 1,
             ttl: .milliseconds(500)
         )
-        #expect(await h.pins.owners(root: root) == ["owner-a"])
+        let after = Date.now
+        let persisted = await h.pins.connection.read {
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+            guard sqlite3_prepare_v2(
+                h.pins.connection.readDb,
+                "SELECT expires_at FROM volume_pins WHERE root=?1 AND owner='owner-a'",
+                -1,
+                &statement,
+                nil
+            ) == SQLITE_OK, let statement else { return nil as String? }
+            sqlite3_bind_text(statement, 1, root, -1, SQLITE_TRANSIENT_SHIM)
+            guard sqlite3_step(statement) == SQLITE_ROW,
+                  let value = sqlite3_column_text(statement, 0) else { return nil }
+            return String(cString: value)
+        }
+        let expiration = try #require(persisted.flatMap(SQLiteConnection.isoFormatter.date(from:)))
+        #expect(expiration.timeIntervalSince(before) >= 0.49)
+        #expect(expiration.timeIntervalSince(after) <= 0.51)
     }
 
     /// Pin counts accumulate per (root, owner); the pin only clears after an

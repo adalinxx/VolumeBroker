@@ -13,7 +13,8 @@ struct CASVolumeStore {
     /// its declared count matches both membership and owned CAS rows and the
     /// root itself is one of those rows.
     static let completeVolumePredicate = """
-        vm.entry_count > 0
+        typeof(vm.entry_count) = 'integer'
+        AND vm.entry_count > 0
         AND vm.entry_count = (
             SELECT COUNT(*) FROM volume_entries manifest_members
             WHERE manifest_members.root = vm.root
@@ -83,6 +84,7 @@ struct CASVolumeStore {
             guard result == SQLITE_ROW else {
                 throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
             }
+            guard sqlite3_column_type(stmt, 0) == SQLITE_INTEGER else { return .invalid }
             expectedCount = Int(sqlite3_column_int64(stmt, 0))
             guard let cidPtr = sqlite3_column_text(stmt, 1),
                   sqlite3_column_type(stmt, 2) != SQLITE_NULL else { return .invalid }
@@ -243,6 +245,9 @@ struct CASVolumeStore {
         let metadataResult = sqlite3_step(metadataStmt)
         let existingEntryCount: Int?
         if metadataResult == SQLITE_ROW {
+            guard sqlite3_column_type(metadataStmt, 0) == SQLITE_INTEGER else {
+                throw BrokerError.conflictingVolume(volume.root)
+            }
             existingEntryCount = Int(sqlite3_column_int64(metadataStmt, 0))
         } else if metadataResult == SQLITE_DONE {
             existingEntryCount = nil

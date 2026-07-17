@@ -173,6 +173,25 @@ struct EvictionEngineTests {
         #expect(await h.pins.owners(root: root).isEmpty)
     }
 
+    @Test func realEntryCountOwnsNothing() async throws {
+        let h = try harness()
+        let root = cid("real-count")
+        try await h.store.storeVolumeLocal(volume("real-count"))
+        try await h.pins.pin(root: root, owner: "owner", count: 1, ttl: nil)
+        try await h.connection.write {
+            try h.connection.exec("""
+                UPDATE volume_metadata
+                SET entry_count=CAST(1.5 AS REAL)
+                WHERE root='\(root)'
+                """)
+        }
+
+        #expect(await h.store.hasVolume(root: root) == false)
+        #expect(try await h.eviction.evictUnpinned(graceSeconds: 0) == 0)
+        #expect(await casRowCount(connection: h.connection, cid: root) == 0)
+        #expect(await h.pins.owners(root: root).isEmpty)
+    }
+
     @Test func cidInvalidVolumeCannotRetainStorage() async throws {
         let h = try harness()
         let retained = RetainedRootIndex(connection: h.connection)
