@@ -19,7 +19,7 @@ struct EvictionEngine {
                 try connection.execBind("DELETE FROM volume_pins WHERE expires_at IS NOT NULL AND expires_at <= ?1") { stmt in
                     sqlite3_bind_text(stmt, 1, now, -1, SQLITE_TRANSIENT_SHIM)
                 }
-                let evictedRoots = try unpinnedRoots(
+                let evictedRoots = try evictableRoots(
                     graceModifier: graceModifier,
                     now: now
                 )
@@ -37,17 +37,8 @@ struct EvictionEngine {
                 try connection.exec("""
                     DELETE FROM volume_entries
                     WHERE NOT EXISTS (
-                        SELECT 1
-                        FROM volume_metadata vm
+                        SELECT 1 FROM volume_metadata vm
                         WHERE vm.root = volume_entries.root
-                          AND \(CASVolumeStore.completeVolumePredicate)
-                    )
-                    """)
-                try connection.exec("""
-                    DELETE FROM volume_metadata
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM volume_entries ve
-                        WHERE ve.root = volume_metadata.root
                     )
                     """)
                 try connection.exec("DELETE FROM volume_pins WHERE root NOT IN (SELECT root FROM volume_metadata)")
@@ -63,7 +54,7 @@ struct EvictionEngine {
         }
     }
 
-    private func unpinnedRoots(graceModifier: String, now: String) throws -> [String] {
+    private func evictableRoots(graceModifier: String, now: String) throws -> [String] {
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
         let sql = """
@@ -73,9 +64,13 @@ struct EvictionEngine {
                 UNION
                 SELECT root FROM retained_roots
             )
-            SELECT root FROM volume_metadata
-            WHERE root NOT IN (SELECT root FROM live_roots)
-              AND stored_at <= datetime('now', ?1)
+            SELECT vm.root
+            FROM volume_metadata vm
+            WHERE NOT (\(CASVolumeStore.completeVolumePredicate))
+               OR (
+                    vm.root NOT IN (SELECT root FROM live_roots)
+                    AND vm.stored_at <= datetime('now', ?1)
+               )
             """
         guard sqlite3_prepare_v2(connection.db, sql, -1, &stmt, nil) == SQLITE_OK,
               let stmt else {

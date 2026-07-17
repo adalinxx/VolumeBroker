@@ -187,7 +187,7 @@ struct EvictionEngineTests {
         }
 
         #expect(await h.store.hasVolume(root: root) == false)
-        #expect(try await h.eviction.evictUnpinned(graceSeconds: 0) == 0)
+        #expect(try await h.eviction.evictUnpinned(graceSeconds: 0) == 1)
         #expect(await casRowCount(connection: h.connection, cid: root) == 0)
         #expect(await h.pins.owners(root: root).isEmpty)
     }
@@ -206,17 +206,22 @@ struct EvictionEngineTests {
         #expect(try await retained.retainedRoots(scope: "canonical") == [root])
     }
 
-    @Test func quarantinedVolumeCannotBecomeNewRetentionRootButIntentSurvives() async throws {
+    @Test func quarantinePreservesIntentUntilExplicitEvictionAndRepublication() async throws {
         let h = try harness()
         let retained = RetainedRootIndex(connection: h.connection)
         let root = cid("corrupt")
         try await h.store.storeVolumeLocal(volume("corrupt"))
         try await retained.advanceRetainedRoots(scope: "canonical", roots: [root])
+        try await h.pins.pin(root: root, owner: "owner", count: 1, ttl: nil)
         try await h.connection.write {
             try h.connection.exec("UPDATE cas_data SET data=X'00' WHERE cid='\(root)'")
         }
         #expect(await h.store.fetchVolumeLocal(root: root) == nil)
-        #expect(await casRowCount(connection: h.connection, cid: root) == 0)
+        #expect(await h.store.hasVolume(root: root) == false)
+        #expect(await h.pins.isPinReachable(cid: root) == false)
+        #expect(await casRowCount(connection: h.connection, cid: root) == 1)
+        #expect(await h.pins.owners(root: root) == ["owner"])
+        #expect(try await retained.retainedRoots(scope: "canonical") == [root])
 
         do {
             try await retained.mergeRetainedRoots(scope: "candidate", roots: [root])
@@ -227,10 +232,20 @@ struct EvictionEngineTests {
         #expect(try await retained.retainedRoots(scope: "canonical") == [root])
         #expect(try await retained.retainedRoots(scope: "candidate").isEmpty)
 
+        await #expect(throws: BrokerError.conflictingContent(root)) {
+            try await h.store.storeVolumeLocal(volume("corrupt"))
+        }
+
+        #expect(try await h.eviction.evictUnpinned(graceSeconds: 60 * 60) == 1)
+        #expect(await casRowCount(connection: h.connection, cid: root) == 0)
+        #expect(await h.pins.owners(root: root).isEmpty)
+        #expect(try await retained.retainedRoots(scope: "canonical") == [root])
+
         try await h.store.storeVolumeLocal(volume("corrupt"))
         #expect(try await retained.retainedRoots(scope: "canonical") == [root])
         #expect(try await h.eviction.evictUnpinned(graceSeconds: 0) == 0)
         #expect(await h.store.hasVolume(root: root))
+        #expect(await h.pins.isPinReachable(cid: root))
     }
 
     @Test func retainedRootReadPropagatesSQLFailure() async throws {

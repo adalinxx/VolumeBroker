@@ -183,4 +183,118 @@ struct PinIndexTests {
         let owners = Set(await h.pins.pinnedOwners(prefix: "candidate:ns:"))
         #expect(owners == ["candidate:ns:5", "candidate:ns:6"])
     }
+
+    @Test func batchAPIsHandleEmptySuccessDuplicatesAndUnfilteredRoots() async throws {
+        let h = try await tempIndex(["r1", "r2"])
+        let r1 = try #require(h.roots["r1"])
+        let r2 = try #require(h.roots["r2"])
+
+        try await h.pins.pinBatch(roots: [], owner: "owner-a")
+        try await h.pins.unpinBatch(items: [])
+        try await h.pins.unpinAllBatch(owners: [])
+        #expect(await h.pins.pinnedRoots().isEmpty)
+
+        try await h.pins.pinBatch(roots: [r1, r1, r2], owner: "owner-a")
+        #expect(Set(await h.pins.pinnedRoots()) == [r1, r2])
+
+        try await h.pins.unpinBatch(items: [
+            (root: r1, owner: "owner-a", count: 1),
+            (root: r2, owner: "owner-a", count: 1),
+        ])
+        #expect(await h.pins.owners(root: r1) == ["owner-a"])
+        #expect(await h.pins.owners(root: r2).isEmpty)
+
+        try await h.pins.unpinBatch(items: [(root: r1, owner: "owner-a", count: 1)])
+        #expect(await h.pins.pinnedRoots().isEmpty)
+    }
+
+    @Test func batchValidationIsAtomic() async throws {
+        let h = try await tempIndex(["r1", "r2"])
+        let r1 = try #require(h.roots["r1"])
+        let r2 = try #require(h.roots["r2"])
+        try await h.pins.pin(root: r1, owner: "existing", count: 2, ttl: nil)
+        try await h.pins.pin(root: r2, owner: "existing", count: 2, ttl: nil)
+
+        await #expect(throws: BrokerError.notFound) {
+            try await h.pins.pinBatch(roots: [r1, "missing"], owner: "batch")
+        }
+        #expect(await h.pins.owners(root: r1) == ["existing"])
+
+        await #expect(throws: BrokerError.invalidPinCount) {
+            try await h.pins.unpinBatch(items: [
+                (root: r1, owner: "existing", count: 1),
+                (root: r2, owner: "existing", count: 0),
+            ])
+        }
+        try await h.pins.unpinBatch(items: [
+            (root: r1, owner: "existing", count: 1),
+            (root: r2, owner: "existing", count: 1),
+        ])
+        #expect(await h.pins.owners(root: r1) == ["existing"])
+        #expect(await h.pins.owners(root: r2) == ["existing"])
+    }
+
+    @Test func pinBatchReplacesExpiredCountAndOwnersRemainIndependent() async throws {
+        let h = try await tempIndex(["r1", "r2"])
+        let r1 = try #require(h.roots["r1"])
+        let r2 = try #require(h.roots["r2"])
+        try await h.pins.pin(root: r1, owner: "owner-a", count: 3, ttl: .zero)
+        try await h.pins.pinBatch(roots: [r1, r2], owner: "owner-a")
+        try await h.pins.pinBatch(roots: [r1, r2], owner: "owner-b")
+
+        try await h.pins.unpin(root: r1, owner: "owner-a", count: 1)
+        #expect(await h.pins.owners(root: r1) == ["owner-b"])
+        #expect(await h.pins.owners(root: r2) == ["owner-a", "owner-b"])
+
+        try await h.pins.unpinAllBatch(owners: ["owner-a", "owner-a"])
+        #expect(await h.pins.owners(root: r2) == ["owner-b"])
+        try await h.pins.unpinAllBatch(owners: ["owner-b"])
+        #expect(await h.pins.pinnedRoots().isEmpty)
+    }
+
+    @Test func batchPinsPersistAcrossReopen() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VolumeBrokerPinIndex-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("volumes.sqlite").path
+        let labels = ["r1", "r2", "expired"]
+        let roots = Dictionary(uniqueKeysWithValues: try labels.map { label in
+            let data = Data(label.utf8)
+            return (label, try CID(
+                version: .v1,
+                codec: .dag_cbor,
+                multihash: try Multihash(raw: data, hashedWith: .sha2_256)
+            ).toBaseEncodedString)
+        })
+        let r1 = try #require(roots["r1"])
+        let r2 = try #require(roots["r2"])
+        let expired = try #require(roots["expired"])
+
+        do {
+            let connection = try SQLiteConnection(path: path)
+            let store = CASVolumeStore(connection: connection)
+            try await store.storeVolumesLocal(labels.map { label in
+                let root = roots[label]!
+                return SerializedVolume(root: root, entries: [root: Data(label.utf8)])
+            })
+            let pins = PinIndex(connection: connection)
+            try await pins.pinBatch(
+                roots: [r1, r1, r2],
+                owner: "owner-a"
+            )
+            try await pins.pin(root: expired, owner: "expired", count: 1, ttl: .zero)
+        }
+
+        let reopened = PinIndex(connection: try SQLiteConnection(path: path))
+        #expect(Set(await reopened.pinnedRoots()) == [r1, r2])
+        try await reopened.unpinBatch(items: [
+            (root: r1, owner: "owner-a", count: 1),
+            (root: r2, owner: "owner-a", count: 1),
+        ])
+        #expect(await reopened.owners(root: r1) == ["owner-a"])
+        #expect(await reopened.owners(root: r2).isEmpty)
+        try await reopened.unpinAllBatch(owners: ["owner-a"])
+        #expect(await reopened.pinnedRoots().isEmpty)
+    }
 }

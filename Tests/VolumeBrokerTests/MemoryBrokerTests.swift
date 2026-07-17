@@ -74,7 +74,7 @@ struct MemoryBrokerTests {
         try fetched.validate()
     }
 
-    @Test func byteBudgetEvictionRespectsReadRecency() async throws {
+    @Test func byteBudgetEvictionRespectsPointReadRecency() async throws {
         // Each payload carries ~1 KiB; the byte budget fits two volumes, not three.
         let firstKiB = Data(repeating: 1, count: 1024)
         let secondKiB = Data(repeating: 2, count: 1024)
@@ -83,9 +83,7 @@ struct MemoryBrokerTests {
         let broker = MemoryBroker(byteBudget: budget)
         try await broker.storeVolumeLocal(payload("A", ["A": firstKiB]))
         try await broker.storeVolumeLocal(payload("B", ["B": secondKiB]))
-        // Refresh A's recency via a read. Without recency-on-read this is a no-op
-        // and eviction is insertion-order (A oldest), so the hot volume A is lost.
-        _ = await broker.fetchDataLocal(cid: cid("A"))
+        _ = await broker.fetchDataLocal(cid: cid(for: firstKiB))
         // Storing C pushes over budget → the coldest UNPINNED volume is evicted.
         try await broker.storeVolumeLocal(payload("C", ["C": thirdKiB]))
         #expect(await broker.fetchVolumeLocal(root: cid("A")) != nil)  // recently read → survives
@@ -409,7 +407,7 @@ struct MemoryBrokerTests {
         let p = payload("r1", ["c1": Data([42])])
         try await remote.storeVolumeLocal(p)
 
-        await local.link(near: remote)
+        local.link(near: remote)
         let fetched = await local.fetchVolume(root: p.root)
         #expect(fetched?.entries[cid(for: Data([42]))] == Data([42]))
     }

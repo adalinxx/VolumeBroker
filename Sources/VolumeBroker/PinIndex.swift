@@ -147,7 +147,7 @@ struct PinIndex {
     /// True iff `cid` is a live Volume root or a direct entry of one. Related
     /// Volume roots are independent and must be pinned or retained separately.
     func isPinReachable(cid: String) async -> Bool {
-        let candidateRoots: [String] = await connection.read {
+        await connection.read {
             let now = isoNow()
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
@@ -158,32 +158,19 @@ struct PinIndex {
                     UNION
                     SELECT root FROM retained_roots
                 )
-                SELECT DISTINCT lr.root
+                SELECT 1
                 FROM live_roots lr
-                LEFT JOIN volume_entries ve ON ve.root = lr.root
-                WHERE lr.root = ?1 OR ve.cid = ?1
+                JOIN volume_metadata vm ON vm.root = lr.root
+                JOIN volume_entries member ON member.root = vm.root AND member.cid = ?1
+                WHERE \(CASVolumeStore.completeVolumePredicate)
+                LIMIT 1
                 """
-            guard sqlite3_prepare_v2(connection.readDb, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+            guard sqlite3_prepare_v2(connection.readDb, sql, -1, &stmt, nil) == SQLITE_OK,
+                  let stmt else { return false }
             sqlite3_bind_text(stmt, 1, cid, -1, SQLITE_TRANSIENT_SHIM)
             sqlite3_bind_text(stmt, 2, now, -1, SQLITE_TRANSIENT_SHIM)
-            var roots: [String] = []
-            while true {
-                let result = sqlite3_step(stmt)
-                if result == SQLITE_DONE { return roots }
-                guard result == SQLITE_ROW,
-                      let root = sqlite3_column_text(stmt, 0) else { return [] }
-                roots.append(String(cString: root))
-            }
+            return sqlite3_step(stmt) == SQLITE_ROW
         }
-
-        let volumes = CASVolumeStore(connection: connection)
-        for root in candidateRoots {
-            if let volume = await volumes.fetchVolumeLocal(root: root),
-               volume.entries[cid] != nil {
-                return true
-            }
-        }
-        return false
     }
 
     func owners(root: String) async -> Set<String> {
@@ -311,10 +298,7 @@ struct PinIndex {
     }
 
     private func validateStoredVolume(root: String) throws {
-        guard case .volume = try CASVolumeStore.loadValidatedVolume(
-            root: root,
-            db: connection.db
-        ) else {
+        guard try CASVolumeStore.isCompleteVolume(root: root, db: connection.db) else {
             throw BrokerError.notFound
         }
     }

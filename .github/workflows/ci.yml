@@ -5,13 +5,57 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
 
 jobs:
   test:
+    name: ${{ matrix.os }} / ${{ matrix.configuration }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, ubuntu-24.04]
+        configuration: [debug, release]
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift --version
+      - run: swift build -c ${{ matrix.configuration }}
+      - run: swift test -c ${{ matrix.configuration }}
+
+  thread-sanitizer:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift --version
+      - run: swift test --sanitize=thread
+
+  address-sanitizer:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift --version
+      - run: swift test --sanitize=address
+
+  stress:
+    if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: macos-26
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - run: swift --version
-      - run: swift build
-      - run: swift test
+      - name: Run representative simultaneous-start shared-state race
+        if: github.event_name == 'pull_request'
+        run: swift test --filter simultaneousStartSharedStateLinearizability
+      - name: Repeat shared-state race in fresh test processes
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: |
+          swift test --filter simultaneousStartSharedStateLinearizability
+          for run in $(seq 2 25); do
+            swift test --skip-build --filter simultaneousStartSharedStateLinearizability
+          done

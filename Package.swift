@@ -10,8 +10,8 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/adalinxx/cashew.git", from: "4.0.1"),
         .package(url: "https://github.com/adalinxx/ArrayTrie.git", from: "1.0.0"),
-        .package(url: "https://github.com/swift-libp2p/swift-cid.git", from: "0.0.1"),
-        .package(url: "https://github.com/swift-libp2p/swift-multihash.git", from: "0.0.1"),
+        .package(url: "https://github.com/swift-libp2p/swift-cid.git", exact: "0.2.1"),
+        .package(url: "https://github.com/swift-libp2p/swift-multihash.git", exact: "0.2.1"),
     ],
     targets: [
         .target(

@@ -13,7 +13,9 @@ struct CASVolumeStore {
     /// its declared count matches both membership and owned CAS rows and the
     /// root itself is one of those rows.
     static let completeVolumePredicate = """
-        typeof(vm.entry_count) = 'integer'
+        typeof(vm.quarantined) = 'integer'
+        AND vm.quarantined = 0
+        AND typeof(vm.entry_count) = 'integer'
         AND vm.entry_count > 0
         AND vm.entry_count = (
             SELECT COUNT(*) FROM volume_entries manifest_members
@@ -23,7 +25,7 @@ struct CASVolumeStore {
             SELECT COUNT(*)
             FROM volume_entries owned_members
             JOIN cas_data owned_data ON owned_data.cid = owned_members.cid
-            WHERE owned_members.root = vm.root AND owned_data.data IS NOT NULL
+            WHERE owned_members.root = vm.root
         )
         AND EXISTS (
             SELECT 1
@@ -31,12 +33,34 @@ struct CASVolumeStore {
             JOIN cas_data root_data ON root_data.cid = root_member.cid
             WHERE root_member.root = vm.root
               AND root_member.cid = vm.root
-              AND root_data.data IS NOT NULL
         )
         """
 
     func hasVolume(root: String) async -> Bool {
-        await fetchVolumeLocal(root: root) != nil
+        await connection.read {
+            (try? Self.isCompleteVolume(root: root, db: connection.readDb)) ?? false
+        }
+    }
+
+    static func isCompleteVolume(root: String, db: OpaquePointer) throws -> Bool {
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        let sql = """
+            SELECT 1
+            FROM volume_metadata vm
+            WHERE vm.root = ?1
+              AND \(completeVolumePredicate)
+            LIMIT 1
+            """
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK,
+              let stmt else {
+            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        sqlite3_bind_text(stmt, 1, root, -1, SQLITE_TRANSIENT_SHIM)
+        let result = sqlite3_step(stmt)
+        if result == SQLITE_ROW { return true }
+        if result == SQLITE_DONE { return false }
+        throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
     }
 
     func fetchVolumeLocal(root: String) async -> SerializedVolume? {
@@ -46,8 +70,8 @@ struct CASVolumeStore {
         switch loaded {
         case .volume(let volume):
             return volume
-        case .invalid:
-            await quarantineInvalidVolume(root: root)
+        case .invalid(let cids):
+            await quarantineInvalidCIDs(cids)
             return nil
         case .missing, nil:
             return nil
@@ -56,7 +80,7 @@ struct CASVolumeStore {
 
     enum ValidatedVolumeLoad: Sendable {
         case missing
-        case invalid
+        case invalid(Set<String>)
         case volume(SerializedVolume)
     }
 
@@ -64,11 +88,12 @@ struct CASVolumeStore {
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
         let sql = """
-            SELECT vm.entry_count, ve.cid, cd.data
+            SELECT ve.cid, cd.data
             FROM volume_metadata vm
-            LEFT JOIN volume_entries ve ON ve.root = vm.root
-            LEFT JOIN cas_data cd ON cd.cid = ve.cid
+            JOIN volume_entries ve ON ve.root = vm.root
+            JOIN cas_data cd ON cd.cid = ve.cid
             WHERE vm.root = ?1
+              AND \(Self.completeVolumePredicate)
             """
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK,
               let stmt else {
@@ -77,85 +102,105 @@ struct CASVolumeStore {
         sqlite3_bind_text(stmt, 1, root, -1, SQLITE_TRANSIENT_SHIM)
 
         var entries: [String: Data] = [:]
-        var expectedCount: Int?
         while true {
             let result = sqlite3_step(stmt)
             if result == SQLITE_DONE { break }
             guard result == SQLITE_ROW else {
                 throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
             }
-            guard sqlite3_column_type(stmt, 0) == SQLITE_INTEGER else { return .invalid }
-            expectedCount = Int(sqlite3_column_int64(stmt, 0))
-            guard let cidPtr = sqlite3_column_text(stmt, 1),
-                  sqlite3_column_type(stmt, 2) != SQLITE_NULL else { return .invalid }
+            guard let cidPtr = sqlite3_column_text(stmt, 0) else {
+                throw BrokerError.sqlFailed("read Volume member CID")
+            }
             let cid = String(cString: cidPtr)
-            let length = Int(sqlite3_column_bytes(stmt, 2))
+            guard sqlite3_column_type(stmt, 1) != SQLITE_NULL else { return .invalid([cid]) }
+            let length = Int(sqlite3_column_bytes(stmt, 1))
             if length == 0 {
                 entries[cid] = Data()
-            } else if let bytes = sqlite3_column_blob(stmt, 2) {
+            } else if let bytes = sqlite3_column_blob(stmt, 1) {
                 entries[cid] = Data(bytes: bytes, count: length)
             } else {
-                return .invalid
+                return .invalid([cid])
             }
         }
-        guard let expectedCount else { return .missing }
-        guard expectedCount > 0, entries.count == expectedCount else { return .invalid }
+        guard !entries.isEmpty else { return .missing }
+        let invalidCIDs = Set(entries.compactMap { cid, data in
+            (try? SerializedVolume.validate(cid: cid, data: data)) == nil ? cid : nil
+        })
+        guard invalidCIDs.isEmpty else { return .invalid(invalidCIDs) }
         let volume = SerializedVolume(root: root, entries: entries)
-        guard (try? volume.validate()) != nil else { return .invalid }
         return .volume(volume)
-    }
-
-    private func quarantineInvalidVolume(root: String) async {
-        try? await connection.write {
-            try connection.transaction {
-                guard case .invalid = try Self.loadValidatedVolume(root: root, db: connection.db) else {
-                    return
-                }
-                try connection.execBind("DELETE FROM volume_metadata WHERE root=?1") { stmt in
-                    sqlite3_bind_text(stmt, 1, root, -1, SQLITE_TRANSIENT_SHIM)
-                }
-                try connection.exec("""
-                    DELETE FROM cas_data
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM volume_entries ve WHERE ve.cid = cas_data.cid
-                    )
-                    """)
-            }
-        }
     }
 
     /// A CAS row is readable only through at least one complete owning Volume.
     func fetchDataLocal(cid: String) async -> Data? {
-        let ownerRoots: [String] = await connection.read {
-            var stmt: OpaquePointer?
-            defer { sqlite3_finalize(stmt) }
-            let sql = """
-                SELECT vm.root
-                FROM volume_entries owner
-                JOIN volume_metadata vm ON vm.root = owner.root
-                WHERE owner.cid = ?1
-                  AND \(Self.completeVolumePredicate)
-                """
-            guard sqlite3_prepare_v2(connection.readDb, sql, -1, &stmt, nil) == SQLITE_OK,
-                  let stmt else { return [] }
-            sqlite3_bind_text(stmt, 1, cid, -1, SQLITE_TRANSIENT_SHIM)
-            var roots: [String] = []
-            while true {
-                let result = sqlite3_step(stmt)
-                if result == SQLITE_DONE { return roots }
-                guard result == SQLITE_ROW,
-                      let root = sqlite3_column_text(stmt, 0) else { return [] }
-                roots.append(String(cString: root))
-            }
+        let data: Data? = await connection.read {
+            try? Self.loadServableData(cid: cid, db: connection.readDb)
         }
+        guard let data else { return nil }
+        do {
+            try SerializedVolume.validate(cid: cid, data: data)
+            return data
+        } catch {
+            await quarantineInvalidCIDs([cid])
+            return nil
+        }
+    }
 
-        for root in ownerRoots {
-            if let volume = await fetchVolumeLocal(root: root),
-               let data = volume.entries[cid] {
-                return data
+    private static func loadServableData(cid: String, db: OpaquePointer) throws -> Data? {
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        let sql = """
+            SELECT cd.data
+            FROM cas_data cd
+            WHERE cd.cid = ?1
+              AND EXISTS (
+                  SELECT 1
+                  FROM volume_entries owner
+                  JOIN volume_metadata vm ON vm.root = owner.root
+                  WHERE owner.cid = cd.cid
+                    AND \(Self.completeVolumePredicate)
+              )
+            LIMIT 1
+            """
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK,
+              let stmt else {
+            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        sqlite3_bind_text(stmt, 1, cid, -1, SQLITE_TRANSIENT_SHIM)
+        let result = sqlite3_step(stmt)
+        if result == SQLITE_DONE { return nil }
+        guard result == SQLITE_ROW, sqlite3_column_type(stmt, 0) != SQLITE_NULL else {
+            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        let length = Int(sqlite3_column_bytes(stmt, 0))
+        if length == 0 { return Data() }
+        guard let bytes = sqlite3_column_blob(stmt, 0) else {
+            throw BrokerError.sqlFailed("read CAS content")
+        }
+        return Data(bytes: bytes, count: length)
+    }
+
+    private func quarantineInvalidCIDs(_ cids: Set<String>) async {
+        guard !cids.isEmpty else { return }
+        try? await connection.write {
+            try connection.transaction {
+                for cid in cids {
+                    guard let data = try Self.loadServableData(cid: cid, db: connection.db),
+                          (try? SerializedVolume.validate(cid: cid, data: data)) == nil else {
+                        continue
+                    }
+                    try connection.execBind(
+                        """
+                        UPDATE volume_metadata
+                        SET quarantined=1
+                        WHERE root IN (SELECT root FROM volume_entries WHERE cid=?1)
+                        """
+                    ) { stmt in
+                        sqlite3_bind_text(stmt, 1, cid, -1, SQLITE_TRANSIENT_SHIM)
+                    }
+                }
             }
         }
-        return nil
     }
 
     func storeVolumeLocal(_ volume: SerializedVolume) async throws {
@@ -187,6 +232,7 @@ struct CASVolumeStore {
                     }
                 }
                 for volume in batch.volumes {
+                    try clearQuarantine(root: volume.root)
                     try verifyComplete(root: volume.root, entryCount: volume.entries.count)
                 }
             }
@@ -352,6 +398,12 @@ struct CASVolumeStore {
         ) { stmt in
             sqlite3_bind_text(stmt, 1, root, -1, SQLITE_TRANSIENT_SHIM)
             sqlite3_bind_text(stmt, 2, cid, -1, SQLITE_TRANSIENT_SHIM)
+        }
+    }
+
+    private func clearQuarantine(root: String) throws {
+        try connection.execBind("UPDATE volume_metadata SET quarantined=0 WHERE root=?1") { stmt in
+            sqlite3_bind_text(stmt, 1, root, -1, SQLITE_TRANSIENT_SHIM)
         }
     }
 

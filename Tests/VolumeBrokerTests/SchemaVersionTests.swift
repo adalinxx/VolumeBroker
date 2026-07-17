@@ -51,9 +51,27 @@ struct SchemaVersionTests {
         return Int(sqlite3_column_int64(stmt, 0))
     }
 
+    private func scalarText(_ db: OpaquePointer, _ sql: String) throws -> String {
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK,
+              let stmt,
+              sqlite3_step(stmt) == SQLITE_ROW,
+              let value = sqlite3_column_text(stmt, 0) else {
+            throw TestDatabaseError.sqlite(String(cString: sqlite3_errmsg(db)))
+        }
+        return String(cString: value)
+    }
+
     private func cid(for data: Data) throws -> String {
         let multihash = try Multihash(raw: data, hashedWith: .sha2_256)
         return try CID(version: .v1, codec: .dag_cbor, multihash: multihash).toBaseEncodedString
+    }
+
+    private func initializeAndStore(path: String, root: String, data: Data) async throws -> Bool {
+        let broker = try DiskBroker(path: path)
+        try await broker.storeVolumeLocal(SerializedVolume(root: root, entries: [root: data]))
+        return await broker.hasVolume(root: root)
     }
 
     @Test func freshDatabaseInitializesV1AndReopens() async throws {
@@ -62,11 +80,7 @@ struct SchemaVersionTests {
         let data = Data("root".utf8)
         let root = try cid(for: data)
 
-        do {
-            let broker = try DiskBroker(path: location.path)
-            try await broker.storeVolumeLocal(SerializedVolume(root: root, entries: [root: data]))
-            #expect(await broker.hasVolume(root: root))
-        }
+        #expect(try await initializeAndStore(path: location.path, root: root, data: data))
 
         try withDatabase(at: location.path) { db in
             let version = try scalar(db, "PRAGMA user_version")
@@ -77,18 +91,18 @@ struct SchemaVersionTests {
         #expect(await reopened.fetchVolumeLocal(root: root)?.entries == [root: data])
     }
 
-    @Test func originalV1MetadataSchemaReopens() throws {
+    @Test func equivalentWhitespaceV1MetadataSchemaReopens() throws {
         let location = try temporaryDatabase()
         defer { try? FileManager.default.removeItem(at: location.directory) }
         _ = try DiskBroker(path: location.path)
         try withDatabase(at: location.path) { db in
             try execute(db, "DROP TABLE volume_metadata")
             try execute(db, """
-                CREATE TABLE volume_metadata (
-                    root TEXT PRIMARY KEY,
-                    entry_count INTEGER NOT NULL CHECK (entry_count > 0),
-                    stored_at TEXT NOT NULL DEFAULT (datetime('now'))
-                )
+                CREATE TABLE volume_metadata
+                (root TEXT PRIMARY KEY, entry_count INTEGER NOT NULL
+                CHECK (entry_count > 0), quarantined INTEGER NOT NULL DEFAULT 0
+                CHECK (typeof(quarantined) = 'integer' AND quarantined IN (0, 1)),
+                stored_at TEXT NOT NULL DEFAULT (datetime('now')))
                 """)
         }
 
@@ -106,11 +120,12 @@ struct SchemaVersionTests {
         #expect(readForeignKeys == 1)
     }
 
-    @Test func writeConnectionUsesFullSynchronous() throws {
+    @Test func writeConnectionUsesWALAndFullSynchronous() throws {
         let location = try temporaryDatabase()
         defer { try? FileManager.default.removeItem(at: location.directory) }
         let connection = try SQLiteConnection(path: location.path)
 
+        #expect(try scalarText(connection.db, "PRAGMA journal_mode").lowercased() == "wal")
         #expect(try scalar(connection.db, "PRAGMA synchronous") == 2)
     }
 
@@ -259,6 +274,8 @@ struct SchemaVersionTests {
                 CREATE TABLE volume_metadata (
                     root TEXT PRIMARY KEY,
                     entry_count INTEGER NOT NULL CHECK (entry_count > 0),
+                    quarantined INTEGER NOT NULL DEFAULT 0
+                        CHECK (typeof(quarantined) = 'integer' AND quarantined IN (0, 1)),
                     stored_at TEXT NOT NULL DEFAULT (datetime('n ow'))
                 )
                 """)

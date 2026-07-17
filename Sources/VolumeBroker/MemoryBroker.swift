@@ -7,7 +7,7 @@ public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRoot
     private struct State {
         var contentByCID: [String: Data] = [:]
         var membersByRoot: [String: Set<String>] = [:]
-        var ownerCountByCID: [String: Int] = [:]
+        var ownersByCID: [String: Set<String>] = [:]
         var insertedAt: [String: ContinuousClock.Instant] = [:]
         var pins: [String: [String: PinEntry]] = [:]
         var retainedRoots: [String: Set<String>] = [:]
@@ -62,11 +62,8 @@ public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRoot
     public func fetchDataLocal(cid: String) async -> Data? {
         lock.withWriteLock {
             guard let data = state.contentByCID[cid],
-                  (state.ownerCountByCID[cid] ?? 0) > 0 else { return nil }
-            let owners = state.membersByRoot.compactMap { root, members in
-                members.contains(cid) && Self.isComplete(root: root, state: state) ? root : nil
-            }
-            guard !owners.isEmpty else { return nil }
+                  let owners = state.ownersByCID[cid],
+                  !owners.isEmpty else { return nil }
             for root in owners { state.lru.touch(root) }
             return data
         }
@@ -87,7 +84,7 @@ public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRoot
                 state.insertedAt[volume.root] = insertedAt
                 for (cid, data) in volume.entries {
                     state.contentByCID[cid] = data
-                    state.ownerCountByCID[cid, default: 0] += 1
+                    state.ownersByCID[cid, default: []].insert(volume.root)
                 }
             }
             for volume in volumes {
@@ -123,7 +120,7 @@ public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRoot
         var requiredBytes = 0
         for cid in requiredCIDs {
             guard let data = submittedContent[cid] ?? state.contentByCID[cid] else {
-                throw BrokerError.capacityExceeded
+                throw BrokerError.inconsistentState("protected CID \(cid) has no resident bytes")
             }
             let (sum, overflow) = requiredBytes.addingReportingOverflow(data.count)
             if overflow { throw BrokerError.capacityExceeded }
@@ -166,7 +163,7 @@ public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRoot
               !members.isEmpty,
               members.contains(root) else { return false }
         return members.allSatisfy { cid in
-            state.contentByCID[cid] != nil && (state.ownerCountByCID[cid] ?? 0) > 0
+            state.contentByCID[cid] != nil && state.ownersByCID[cid]?.contains(root) == true
         }
     }
 
@@ -187,12 +184,13 @@ public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRoot
         guard let members = state.membersByRoot.removeValue(forKey: root) else { return 0 }
         var freedBytes = 0
         for cid in members {
-            let remainingOwners = (state.ownerCountByCID[cid] ?? 1) - 1
-            if remainingOwners <= 0 {
-                state.ownerCountByCID.removeValue(forKey: cid)
+            var owners = state.ownersByCID[cid] ?? []
+            owners.remove(root)
+            if owners.isEmpty {
+                state.ownersByCID.removeValue(forKey: cid)
                 freedBytes += state.contentByCID.removeValue(forKey: cid)?.count ?? 0
             } else {
-                state.ownerCountByCID[cid] = remainingOwners
+                state.ownersByCID[cid] = owners
             }
         }
         state.insertedAt.removeValue(forKey: root)

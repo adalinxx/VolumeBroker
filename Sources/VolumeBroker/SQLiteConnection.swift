@@ -168,6 +168,18 @@ final class SQLiteConnection: @unchecked Sendable {
         return Int(sqlite3_column_int64(stmt, 0))
     }
 
+    private static func scalarText(db: OpaquePointer, _ sql: String) throws -> String {
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK,
+              let stmt,
+              sqlite3_step(stmt) == SQLITE_ROW,
+              let text = sqlite3_column_text(stmt, 0) else {
+            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        return String(cString: text)
+    }
+
     private static func initializeSchemaIfNeeded(db: OpaquePointer) throws {
         try execRaw(db: db, "BEGIN IMMEDIATE")
         do {
@@ -213,6 +225,8 @@ final class SQLiteConnection: @unchecked Sendable {
             CREATE TABLE volume_metadata (
                 root TEXT PRIMARY KEY,
                 entry_count INTEGER NOT NULL CHECK (entry_count > 0),
+                quarantined INTEGER NOT NULL DEFAULT 0
+                    CHECK (typeof(quarantined) = 'integer' AND quarantined IN (0, 1)),
                 stored_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
             """),
@@ -314,12 +328,55 @@ final class SQLiteConnection: @unchecked Sendable {
     }
 
     private static func canonicalSQL(_ sql: String) -> String {
-        sql.trimmingCharacters(in: .whitespacesAndNewlines)
+        func needsSeparator(_ lhs: Character, _ rhs: Character) -> Bool {
+            let quotes: Set<Character> = ["'", "\"", "`"]
+            let lhsIsWord = lhs.isLetter || lhs.isNumber || lhs == "_" || lhs == "$"
+            let rhsIsWord = rhs.isLetter || rhs.isNumber || rhs == "_" || rhs == "$"
+            return (lhsIsWord && rhsIsWord) || quotes.contains(lhs) || quotes.contains(rhs)
+        }
+
+        var normalized = ""
+        var quote: Character?
+        var pendingSpace = false
+        let characters = Array(sql.trimmingCharacters(in: .whitespacesAndNewlines))
+        var index = 0
+
+        while index < characters.count {
+            let character = characters[index]
+            if let activeQuote = quote {
+                normalized.append(character)
+                if character == activeQuote {
+                    if index + 1 < characters.count, characters[index + 1] == activeQuote {
+                        index += 1
+                        normalized.append(characters[index])
+                    } else {
+                        quote = nil
+                    }
+                }
+            } else if character == "'" || character == "\"" || character == "`" {
+                if pendingSpace, let previous = normalized.last,
+                   needsSeparator(previous, character) { normalized.append(" ") }
+                pendingSpace = false
+                quote = character
+                normalized.append(character)
+            } else if character.isWhitespace {
+                pendingSpace = true
+            } else {
+                if pendingSpace, let previous = normalized.last,
+                   needsSeparator(previous, character) { normalized.append(" ") }
+                pendingSpace = false
+                normalized.append(character)
+            }
+            index += 1
+        }
+        return normalized
     }
 
     private static func configureWriteConnection(db: OpaquePointer) throws {
         try enableForeignKeys(db: db)
-        try execRaw(db: db, "PRAGMA journal_mode=WAL")
+        guard try scalarText(db: db, "PRAGMA journal_mode=WAL").lowercased() == "wal" else {
+            throw BrokerError.sqlFailed("SQLite journal_mode=WAL unavailable")
+        }
         // Reads and writes wait out short WAL/checkpoint contention windows.
         try execRaw(db: db, "PRAGMA busy_timeout=5000")
         try execRaw(db: db, "PRAGMA synchronous=FULL")

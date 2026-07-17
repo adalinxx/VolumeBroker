@@ -95,10 +95,7 @@ struct RetainedRootIndex {
     }
 
     private func validateStoredVolume(root: String) throws {
-        guard case .volume = try CASVolumeStore.loadValidatedVolume(
-            root: root,
-            db: connection.db
-        ) else {
+        guard try CASVolumeStore.isCompleteVolume(root: root, db: connection.db) else {
             throw BrokerError.missingRetainedRoot(root)
         }
     }

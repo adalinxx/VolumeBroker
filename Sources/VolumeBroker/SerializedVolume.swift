@@ -23,71 +23,79 @@ public extension SerializedVolume {
         guard entries[root] != nil else { throw SerializedVolumeError.missingRootEntry(root) }
 
         for (rawCID, data) in entries {
-            let expected = try parsedCID(rawCID)
-            let canonical: CID
-            do {
-                canonical = try CID(
-                    version: expected.version,
-                    codec: expected.codec,
-                    multihash: expected.multihash
-                )
-            } catch {
-                throw SerializedVolumeError.invalidCID(rawCID)
-            }
-            guard canonical.toBaseEncodedString == rawCID else {
-                throw SerializedVolumeError.invalidCID(rawCID)
-            }
-            guard let algorithm = expected.multihash.algorithm,
-                  let digestLength = expected.multihash.length,
-                  let expectedDigest = expected.multihash.digest,
-                  digestLength > 0 else {
-                throw SerializedVolumeError.invalidCID(rawCID)
-            }
-            if expected.version == .v0 {
-                guard expected.codec == .dag_pb,
-                      algorithm == .sha2_256,
-                      digestLength == 32 else {
-                    throw SerializedVolumeError.invalidCID(rawCID)
-                }
-            }
+            try Self.validate(cid: rawCID, data: data)
+        }
+    }
+}
 
-            if algorithm == .identity {
-                guard expectedDigest.count == digestLength,
-                      Data(expectedDigest) == data else {
-                    throw SerializedVolumeError.contentAddressMismatch(rawCID)
-                }
-                continue
-            }
-
-            let actualMultihash: Multihash
-            do {
-                actualMultihash = try Multihash(
-                    raw: data,
-                    hashedWith: algorithm,
-                    customByteLength: digestLength
-                )
-            } catch {
+extension SerializedVolume {
+    /// Validate one self-authenticating CAS entry without constructing or
+    /// traversing a whole Volume.
+    static func validate(cid rawCID: String, data: Data) throws {
+        let expected = try parsedCID(rawCID)
+        let canonical: CID
+        do {
+            canonical = try CID(
+                version: expected.version,
+                codec: expected.codec,
+                multihash: expected.multihash
+            )
+        } catch {
+            throw SerializedVolumeError.invalidCID(rawCID)
+        }
+        guard canonical.toBaseEncodedString == rawCID else {
+            throw SerializedVolumeError.invalidCID(rawCID)
+        }
+        guard let algorithm = expected.multihash.algorithm,
+              let digestLength = expected.multihash.length,
+              let expectedDigest = expected.multihash.digest,
+              digestLength > 0 else {
+            throw SerializedVolumeError.invalidCID(rawCID)
+        }
+        if expected.version == .v0 {
+            guard expected.codec == .dag_pb,
+                  algorithm == .sha2_256,
+                  digestLength == 32 else {
                 throw SerializedVolumeError.invalidCID(rawCID)
             }
+        }
 
-            let actual: CID
-            do {
-                actual = try CID(
-                    version: expected.version,
-                    codec: expected.codec,
-                    multihash: actualMultihash
-                )
-            } catch {
-                throw SerializedVolumeError.invalidCID(rawCID)
-            }
-
-            guard actual == expected else {
+        if algorithm == .identity {
+            guard expectedDigest.count == digestLength,
+                  Data(expectedDigest) == data else {
                 throw SerializedVolumeError.contentAddressMismatch(rawCID)
             }
+            return
+        }
+
+        let actualMultihash: Multihash
+        do {
+            actualMultihash = try Multihash(
+                raw: data,
+                hashedWith: algorithm,
+                customByteLength: digestLength
+            )
+        } catch {
+            throw SerializedVolumeError.invalidCID(rawCID)
+        }
+
+        let actual: CID
+        do {
+            actual = try CID(
+                version: expected.version,
+                codec: expected.codec,
+                multihash: actualMultihash
+            )
+        } catch {
+            throw SerializedVolumeError.invalidCID(rawCID)
+        }
+
+        guard actual == expected else {
+            throw SerializedVolumeError.contentAddressMismatch(rawCID)
         }
     }
 
-    private func parsedCID(_ rawCID: String) throws -> CID {
+    private static func parsedCID(_ rawCID: String) throws -> CID {
         do {
             return try CID(rawCID)
         } catch {

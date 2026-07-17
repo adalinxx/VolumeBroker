@@ -2,14 +2,151 @@ import Testing
 import Foundation
 import CID
 import Multihash
+#if canImport(SQLite3)
+import SQLite3
+#else
+import VolumeBrokerSQLite
+#endif
 @testable import VolumeBroker
 
 @Suite("DiskBroker")
 struct DiskBrokerTests {
 
+    private actor StartBarrier {
+        private var remaining: Int
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        init(participants: Int) {
+            remaining = participants
+        }
+
+        func wait() async {
+            remaining -= 1
+            guard remaining > 0 else {
+                let waiting = waiters
+                waiters.removeAll()
+                for waiter in waiting { waiter.resume() }
+                return
+            }
+            await withCheckedContinuation { waiters.append($0) }
+        }
+    }
+
+    private struct StorePinObservation: Equatable {
+        let volumeExists: Bool
+        let pinned: Bool
+        let pinSucceeded: Bool
+    }
+
+    private struct EvictPinObservation: Equatable {
+        let evicted: Int
+        let volumeExists: Bool
+        let pinned: Bool
+        let pinSucceeded: Bool
+    }
+
+    private static func capture<Value: Sendable>(
+        _ operation: @escaping @Sendable () async throws -> Value
+    ) async -> Result<Value, BrokerError> {
+        do {
+            return .success(try await operation())
+        } catch let error as BrokerError {
+            return .failure(error)
+        } catch {
+            return .failure(.sqlFailed("unexpected test error: \(error)"))
+        }
+    }
+
+    private static func race<Left: Sendable, Right: Sendable>(
+        _ left: @escaping @Sendable () async -> Left,
+        _ right: @escaping @Sendable () async -> Right
+    ) async -> (Left, Right) {
+        let barrier = StartBarrier(participants: 2)
+        async let leftResult: Left = {
+            await barrier.wait()
+            return await left()
+        }()
+        async let rightResult: Right = {
+            await barrier.wait()
+            return await right()
+        }()
+        return await (leftResult, rightResult)
+    }
+
     private func tempDB(evictUnpinnedGraceSeconds: Int = 0) throws -> DiskBroker {
         let path = NSTemporaryDirectory() + "vb_test_\(UUID().uuidString).sqlite"
         return try DiskBroker(path: path, evictUnpinnedGraceSeconds: evictUnpinnedGraceSeconds)
+    }
+
+    private func temporaryDatabase() throws -> (directory: URL, path: String) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VolumeBrokerDisk-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return (directory, directory.appendingPathComponent("volumes.sqlite").path)
+    }
+
+    private func databaseHealth(at path: String) throws -> (integrity: String, foreignKeyViolations: Int) {
+        var database: OpaquePointer?
+        guard sqlite3_open_v2(path, &database, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
+              let database else {
+            throw BrokerError.openFailed("health-check open failed")
+        }
+        defer { sqlite3_close(database) }
+
+        func text(_ sql: String) throws -> String {
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+            guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK,
+                  let statement,
+                  sqlite3_step(statement) == SQLITE_ROW,
+                  let value = sqlite3_column_text(statement, 0) else {
+                throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(database)))
+            }
+            return String(cString: value)
+        }
+
+        func count(_ sql: String) throws -> Int {
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+            guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK,
+                  let statement,
+                  sqlite3_step(statement) == SQLITE_ROW else {
+                throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(database)))
+            }
+            return Int(sqlite3_column_int64(statement, 0))
+        }
+
+        return (
+            try text("PRAGMA integrity_check"),
+            try count("SELECT COUNT(*) FROM pragma_foreign_key_check")
+        )
+    }
+
+    private func pinCount(at path: String, root: String, owner: String) throws -> Int {
+        var database: OpaquePointer?
+        guard sqlite3_open_v2(path, &database, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
+              let database else {
+            throw BrokerError.openFailed("pin-count open failed")
+        }
+        defer { sqlite3_close(database) }
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(
+            database,
+            "SELECT COALESCE(MAX(count), 0) FROM volume_pins WHERE root=?1 AND owner=?2",
+            -1,
+            &statement,
+            nil
+        ) == SQLITE_OK, let statement else {
+            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(database)))
+        }
+        sqlite3_bind_text(statement, 1, root, -1, SQLITE_TRANSIENT_SHIM)
+        sqlite3_bind_text(statement, 2, owner, -1, SQLITE_TRANSIENT_SHIM)
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(database)))
+        }
+        return Int(sqlite3_column_int64(statement, 0))
     }
 
     private func cid(for data: Data) -> String {
@@ -187,6 +324,62 @@ struct DiskBrokerTests {
         #expect(await broker.hasVolume(root: drop) == false)
     }
 
+    @Test func persistedRetentionSurvivesReopenThenControlsEviction() async throws {
+        let location = try temporaryDatabase()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        let permanent = cid("permanent")
+        let retained = cid("retained")
+        let expired = cid("expired")
+        let unprotected = cid("unprotected")
+        let missing = cid("missing")
+
+        do {
+            let broker = try DiskBroker(path: location.path, evictUnpinnedGraceSeconds: 0)
+            try await broker.storeVolumesLocal([
+                payload("permanent"), payload("retained"), payload("expired"), payload("unprotected"),
+            ])
+            try await broker.pinBatch(roots: [permanent], owner: "owner")
+            try await broker.pin(root: expired, owner: "expired", ttl: .zero)
+            try await broker.advanceRetainedRoots(scope: "canonical", roots: [retained])
+
+            await #expect(throws: BrokerError.missingRetainedRoot(missing)) {
+                try await broker.advanceRetainedRoots(
+                    scope: "canonical",
+                    roots: [permanent, missing]
+                )
+            }
+            await #expect(throws: BrokerError.missingRetainedRoot(missing)) {
+                try await broker.mergeRetainedRoots(
+                    scope: "canonical",
+                    roots: [unprotected, missing]
+                )
+            }
+            #expect(try await broker.retainedRoots(scope: "canonical") == [retained])
+        }
+
+        let reopened = try DiskBroker(path: location.path, evictUnpinnedGraceSeconds: 0)
+        #expect(Set(await reopened.pinnedRoots()) == [permanent])
+        #expect(await reopened.owners(root: permanent) == ["owner"])
+        #expect(await reopened.owners(root: expired).isEmpty)
+        #expect(try await reopened.retainedRoots(scope: "canonical") == [retained])
+
+        #expect(try await reopened.evictUnpinned() == 2)
+        #expect(await reopened.hasVolume(root: permanent))
+        #expect(await reopened.hasVolume(root: retained))
+        #expect(await reopened.hasVolume(root: expired) == false)
+        #expect(await reopened.hasVolume(root: unprotected) == false)
+
+        try await reopened.unpinBatch(items: [(root: permanent, owner: "owner", count: 1)])
+        try await reopened.advanceRetainedRoots(scope: "canonical", roots: [])
+        #expect(try await reopened.evictUnpinned() == 2)
+        #expect(await reopened.hasVolume(root: permanent) == false)
+        #expect(await reopened.hasVolume(root: retained) == false)
+
+        let health = try databaseHealth(at: location.path)
+        #expect(health.integrity == "ok")
+        #expect(health.foreignKeyViolations == 0)
+    }
+
     @Test func retainedRootMergeRequiresStoredRoots() async throws {
         let broker = try tempDB()
         let missing = cid("missing")
@@ -359,6 +552,131 @@ struct DiskBrokerTests {
         ))
 
         #expect(roots == [cid("exact-root"), cid("height-root"), cid("candidate-root")])
+    }
+
+    @Test func simultaneousStartSharedStateLinearizability() async throws {
+        do {
+            let location = try temporaryDatabase()
+            defer { try? FileManager.default.removeItem(at: location.directory) }
+            let broker = try DiskBroker(path: location.path)
+            let volume = payload("pin-unpin")
+            let owner = "shared-owner"
+            try await broker.storeVolumeLocal(volume)
+            try await broker.pin(root: volume.root, owner: owner)
+
+            let (pin, unpin) = await Self.race(
+                { await Self.capture { try await broker.pin(root: volume.root, owner: owner, count: 2) } },
+                { await Self.capture { try await broker.unpin(root: volume.root, owner: owner, count: 2) } }
+            )
+            _ = try pin.get()
+            _ = try unpin.get()
+
+            // pin -> unpin leaves 1; unpin -> pin leaves 2.
+            let count = try pinCount(at: location.path, root: volume.root, owner: owner)
+            #expect([1, 2].contains(count), "pin/unpin count: \(count)")
+            let health = try databaseHealth(at: location.path)
+            #expect(health.integrity == "ok" && health.foreignKeyViolations == 0)
+        }
+
+        do {
+            let location = try temporaryDatabase()
+            defer { try? FileManager.default.removeItem(at: location.directory) }
+            let broker = try DiskBroker(path: location.path)
+            let volume = payload("store-pin")
+            let owner = "shared-owner"
+
+            let (store, pin) = await Self.race(
+                { await Self.capture { try await broker.storeVolumeLocal(volume); return true } },
+                { await Self.capture { try await broker.pin(root: volume.root, owner: owner); return true } }
+            )
+            _ = try store.get()
+            let pinSucceeded: Bool
+            switch pin {
+            case .success:
+                pinSucceeded = true
+            case .failure(.notFound):
+                pinSucceeded = false
+            case .failure(let error):
+                throw error
+            }
+
+            let observed = StorePinObservation(
+                volumeExists: await broker.hasVolume(root: volume.root),
+                pinned: await broker.owners(root: volume.root).contains(owner),
+                pinSucceeded: pinSucceeded
+            )
+            let serialOutcomes = [
+                StorePinObservation(volumeExists: true, pinned: true, pinSucceeded: true),
+                StorePinObservation(volumeExists: true, pinned: false, pinSucceeded: false),
+            ]
+            #expect(serialOutcomes.contains(observed), "store/pin observed: \(observed)")
+            let health = try databaseHealth(at: location.path)
+            #expect(health.integrity == "ok" && health.foreignKeyViolations == 0)
+        }
+
+        do {
+            let location = try temporaryDatabase()
+            defer { try? FileManager.default.removeItem(at: location.directory) }
+            let broker = try DiskBroker(path: location.path)
+            let volumes = ["retained-a", "retained-b", "retained-c"].map { payload($0) }
+            let scope = "shared-scope"
+            try await broker.storeVolumesLocal(volumes)
+            try await broker.advanceRetainedRoots(scope: scope, roots: [volumes[0].root])
+
+            let (replace, merge) = await Self.race(
+                { await Self.capture { try await broker.advanceRetainedRoots(scope: scope, roots: [volumes[1].root]); return true } },
+                { await Self.capture { try await broker.mergeRetainedRoots(scope: scope, roots: [volumes[2].root]); return true } }
+            )
+            _ = try replace.get()
+            _ = try merge.get()
+
+            let observed = Set(try await broker.retainedRoots(scope: scope))
+            let serialOutcomes: [Set<String>] = [
+                [volumes[1].root],
+                [volumes[1].root, volumes[2].root],
+            ]
+            #expect(serialOutcomes.contains(observed), "replace/merge observed: \(observed)")
+            let health = try databaseHealth(at: location.path)
+            #expect(health.integrity == "ok" && health.foreignKeyViolations == 0)
+        }
+
+        do {
+            let location = try temporaryDatabase()
+            defer { try? FileManager.default.removeItem(at: location.directory) }
+            let broker = try DiskBroker(path: location.path, evictUnpinnedGraceSeconds: 0)
+            let volume = payload("evict-pin")
+            let owner = "shared-owner"
+            try await broker.storeVolumeLocal(volume)
+
+            let (eviction, pin) = await Self.race(
+                { await Self.capture { try await broker.evictUnpinned() } },
+                { await Self.capture { try await broker.pin(root: volume.root, owner: owner); return true } }
+            )
+            let evicted = try eviction.get()
+            let pinSucceeded: Bool
+            switch pin {
+            case .success:
+                pinSucceeded = true
+            case .failure(.notFound):
+                pinSucceeded = false
+            case .failure(let error):
+                throw error
+            }
+
+            let observed = EvictPinObservation(
+                evicted: evicted,
+                volumeExists: await broker.hasVolume(root: volume.root),
+                pinned: await broker.owners(root: volume.root).contains(owner),
+                pinSucceeded: pinSucceeded
+            )
+            let serialOutcomes = [
+                EvictPinObservation(evicted: 0, volumeExists: true, pinned: true, pinSucceeded: true),
+                EvictPinObservation(evicted: 1, volumeExists: false, pinned: false, pinSucceeded: false),
+            ]
+            #expect(serialOutcomes.contains(observed), "eviction/pin observed: \(observed)")
+            let health = try databaseHealth(at: location.path)
+            #expect(health.integrity == "ok" && health.foreignKeyViolations == 0)
+        }
     }
 
     /// Regression: DiskBroker is shared across multiple ChainNetwork actors.

@@ -43,7 +43,9 @@ try await root.store(
 ```
 
 `.recursive` selects every nested Volume below a path. Each emitted Volume is
-still an independent storage and retention unit.
+still an independent storage and retention unit. Cashew submits one Volume per
+storer callback; callers that already hold an all-or-none batch can use
+`storeVolumesLocal` to commit it in one transaction.
 
 Resolve through the read cascade:
 
@@ -75,8 +77,8 @@ try await disk.advanceRetainedRoots(
 
 Replacing a scope with the same root set is naturally idempotent, as is merging
 roots already in the set. `mergeRetainedRoots` adds roots without replacing the
-set. The node or application owns operation ordering, transition identity, and
-replay policy.
+set. Pin-count mutations are not replay-deduplicated. The node or application
+must durably own transition identity, ordering, and replay policy.
 
 ```swift
 let evicted = try await disk.evictUnpinned()
@@ -89,12 +91,14 @@ owner is removed.
 ## Implementations
 
 - `MemoryBroker` supports count or byte limits and LRU eviction.
-- `DiskBroker` uses SQLite, WAL, foreign keys, and schema v1 validation.
+- `DiskBroker` uses SQLite, WAL, foreign keys, deliberate `synchronous=FULL`
+  durability, and schema v1 validation.
 - `BrokerStorer` and `BrokerFetcher` connect Cashew storage and resolution.
 - `ContentStore` stores and resolves Cashew `Node` values by root CID.
 
-`DiskBroker` initializes only an empty v0 database. Nonempty v0, malformed v1,
-and future schemas fail closed; migrations are explicit application work.
+`DiskBroker` initializes only an empty v0 database. A nonempty v0 store requires
+a new database path or explicit export/rematerialization. Malformed v1 and
+future schemas fail closed.
 
 ## Boundary
 
