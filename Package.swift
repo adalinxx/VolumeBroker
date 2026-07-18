@@ -8,8 +8,10 @@ let package = Package(
         .library(name: "VolumeBroker", targets: ["VolumeBroker"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/adalinxx/cashew.git", from: "3.0.0"),
+        .package(url: "https://github.com/adalinxx/cashew.git", exact: "4.0.1"),
         .package(url: "https://github.com/adalinxx/ArrayTrie.git", from: "1.0.0"),
+        .package(url: "https://github.com/swift-libp2p/swift-cid.git", exact: "0.2.1"),
+        .package(url: "https://github.com/swift-libp2p/swift-multihash.git", exact: "0.2.1"),
     ],
     targets: [
         .target(
@@ -23,15 +25,27 @@ let package = Package(
                 "VolumeBrokerSQLite",
                 .product(name: "cashew", package: "cashew"),
                 .product(name: "ArrayTrie", package: "ArrayTrie"),
+                .product(name: "CID", package: "swift-cid"),
+                .product(name: "Multihash", package: "swift-multihash"),
             ]
         ),
         .testTarget(
             name: "VolumeBrokerTests",
-            dependencies: ["VolumeBroker"]
+            dependencies: [
+                "VolumeBroker",
+                "VolumeBrokerSQLite",
+                .product(name: "cashew", package: "cashew"),
+                .product(name: "CID", package: "swift-cid"),
+                .product(name: "Multihash", package: "swift-multihash"),
+            ]
         ),
         .testTarget(
             name: "VolumeBrokerBenchmarks",
-            dependencies: ["VolumeBroker"]
+            dependencies: [
+                "VolumeBroker",
+                .product(name: "CID", package: "swift-cid"),
+                .product(name: "Multihash", package: "swift-multihash"),
+            ]
         ),
     ]
 )

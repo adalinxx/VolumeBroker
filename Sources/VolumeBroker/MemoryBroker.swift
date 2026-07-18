@@ -5,11 +5,12 @@ public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRoot
     public var far: (any VolumeBroker)?
 
     private struct State {
-        var volumes: [String: SerializedVolume] = [:]
+        var contentByCID: [String: Data] = [:]
+        var membersByRoot: [String: Set<String>] = [:]
+        var ownersByCID: [String: Set<String>] = [:]
         var insertedAt: [String: ContinuousClock.Instant] = [:]
         var pins: [String: [String: PinEntry]] = [:]
         var retainedRoots: [String: Set<String>] = [:]
-        var retainedRootOperations: [String: (scope: String, payload: String)] = [:]
         var lru = LRUOrder()
     }
 
@@ -34,21 +35,17 @@ public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRoot
         self.evictUnpinnedGrace = evictUnpinnedGrace
     }
 
-    /// Sum of stored `SerializedVolume.entries` payload sizes currently resident.
+    /// Sum of unique content payload sizes currently resident.
     public func residentBytes() async -> Int {
-        lock.withReadLock { Self.residentBytes(state.volumes) }
+        lock.withReadLock { Self.residentBytes(state: state) }
     }
 
-    private static func payloadBytes(_ volume: SerializedVolume) -> Int {
-        volume.entries.values.reduce(0) { $0 + $1.count }
-    }
-
-    private static func residentBytes(_ volumes: [String: SerializedVolume]) -> Int {
-        volumes.values.reduce(0) { $0 + payloadBytes($1) }
+    private static func residentBytes(state: State) -> Int {
+        state.contentByCID.values.reduce(0) { $0 + $1.count }
     }
 
     public func hasVolume(root: String) async -> Bool {
-        lock.withReadLock { state.volumes[root] != nil }
+        lock.withReadLock { Self.isComplete(root: root, state: state) }
     }
 
     public func fetchVolumeLocal(root: String) async -> SerializedVolume? {
@@ -56,55 +53,165 @@ public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRoot
         // eviction is genuinely least-recently-used, not insertion-order, for
         // read-heavy workloads. Requires the write lock to mutate `state.lru`.
         lock.withWriteLock {
-            guard let volume = state.volumes[root] else { return nil }
+            guard let volume = Self.volume(root: root, state: state) else { return nil }
             state.lru.touch(root)
             return volume
         }
     }
 
     public func fetchDataLocal(cid: String) async -> Data? {
-        // The memory tier groups by volume root; resolve a content CID by
-        // checking the volume keyed by it (common case) then scanning entries.
-        lock.withReadLock {
-            if let data = state.volumes[cid]?.entries[cid] { return data }
-            for volume in state.volumes.values {
-                if let data = volume.entries[cid] { return data }
-            }
-            return nil
-        }
-    }
-
-    public func storeVolumeLocal(_ volume: SerializedVolume) async throws {
-        let insertedAt = ContinuousClock.Instant.now
         lock.withWriteLock {
-            let isNewRoot = state.volumes[volume.root] == nil
-            state.volumes[volume.root] = volume
-            if isNewRoot { state.insertedAt[volume.root] = insertedAt }
-            state.lru.touch(volume.root)
+            guard let data = state.contentByCID[cid],
+                  let owners = state.ownersByCID[cid],
+                  !owners.isEmpty else { return nil }
+            for root in owners { state.lru.touch(root) }
+            return data
         }
-        evictIfOverCapacity()
-        evictIfOverByteBudget()
     }
 
     public func storeVolumesLocal(_ volumes: [SerializedVolume]) async throws {
+        let volumes = volumes.map { $0.ownedCopy() }
+        for volume in volumes { try volume.validate() }
+        guard !volumes.isEmpty else { return }
         let insertedAt = ContinuousClock.Instant.now
-        lock.withWriteLock {
+        try lock.withWriteLock {
+            let submittedRoots = Set(volumes.map(\.root))
+            let newVolumes = try Self.preflight(volumes, state: state)
+            try ensureBatchFits(volumes, state: state)
+            for volume in newVolumes {
+                let members = Set(volume.entries.keys)
+                state.membersByRoot[volume.root] = members
+                state.insertedAt[volume.root] = insertedAt
+                for (cid, data) in volume.entries {
+                    state.contentByCID[cid] = data
+                    state.ownersByCID[cid, default: []].insert(volume.root)
+                }
+            }
             for volume in volumes {
-                let isNewRoot = state.volumes[volume.root] == nil
-                state.volumes[volume.root] = volume
-                if isNewRoot { state.insertedAt[volume.root] = insertedAt }
                 state.lru.touch(volume.root)
             }
+            evictIfOverCapacity(protecting: submittedRoots, state: &state)
+            evictIfOverByteBudget(protecting: submittedRoots, state: &state)
         }
-        evictIfOverCapacity()
-        evictIfOverByteBudget()
+    }
+
+    private func ensureBatchFits(_ volumes: [SerializedVolume], state: State) throws {
+        let submittedRoots = Set(volumes.map(\.root))
+        let existingRoots = Set(state.membersByRoot.keys)
+        let protectedRoots = Self.protectedRoots(state: state, now: .now)
+            .intersection(existingRoots)
+        let requiredRoots = submittedRoots.union(protectedRoots)
+
+        if let capacity, requiredRoots.count > capacity {
+            throw BrokerError.capacityExceeded
+        }
+        guard let byteBudget else { return }
+
+        var requiredCIDs = Set<String>()
+        for root in requiredRoots {
+            requiredCIDs.formUnion(state.membersByRoot[root] ?? [])
+        }
+        var submittedContent: [String: Data] = [:]
+        for volume in volumes {
+            requiredCIDs.formUnion(volume.entries.keys)
+            submittedContent.merge(volume.entries) { current, _ in current }
+        }
+
+        var requiredBytes = 0
+        for cid in requiredCIDs {
+            guard let data = submittedContent[cid] ?? state.contentByCID[cid] else {
+                throw BrokerError.inconsistentState("protected CID \(cid) has no resident bytes")
+            }
+            let (sum, overflow) = requiredBytes.addingReportingOverflow(data.count)
+            if overflow { throw BrokerError.capacityExceeded }
+            requiredBytes = sum
+        }
+        if requiredBytes > byteBudget { throw BrokerError.capacityExceeded }
+    }
+
+    private static func preflight(_ volumes: [SerializedVolume], state: State) throws -> [SerializedVolume] {
+        var pendingMemberships: [String: Set<String>] = [:]
+        var pendingContent: [String: Data] = [:]
+        var newVolumes: [SerializedVolume] = []
+
+        for volume in volumes {
+            let members = Set(volume.entries.keys)
+            if let existing = pendingMemberships[volume.root] ?? state.membersByRoot[volume.root],
+               existing != members {
+                throw BrokerError.conflictingVolume(volume.root)
+            }
+            if pendingMemberships[volume.root] == nil {
+                pendingMemberships[volume.root] = members
+                if state.membersByRoot[volume.root] == nil {
+                    newVolumes.append(volume)
+                }
+            }
+
+            for (cid, data) in volume.entries {
+                if let existing = pendingContent[cid] ?? state.contentByCID[cid],
+                   existing != data {
+                    throw BrokerError.conflictingContent(cid)
+                }
+                pendingContent[cid] = data
+            }
+        }
+        return newVolumes
+    }
+
+    private static func isComplete(root: String, state: State) -> Bool {
+        guard let members = state.membersByRoot[root],
+              !members.isEmpty,
+              members.contains(root) else { return false }
+        return members.allSatisfy { cid in
+            state.contentByCID[cid] != nil && state.ownersByCID[cid]?.contains(root) == true
+        }
+    }
+
+    private static func volume(root: String, state: State) -> SerializedVolume? {
+        guard isComplete(root: root, state: state),
+              let members = state.membersByRoot[root] else { return nil }
+        var entries: [String: Data] = [:]
+        entries.reserveCapacity(members.count)
+        for cid in members {
+            guard let data = state.contentByCID[cid] else { return nil }
+            entries[cid] = data
+        }
+        return SerializedVolume(root: root, entries: entries)
+    }
+
+    @discardableResult
+    private static func removeVolume(root: String, state: inout State) -> Int {
+        guard let members = state.membersByRoot.removeValue(forKey: root) else { return 0 }
+        var freedBytes = 0
+        for cid in members {
+            var owners = state.ownersByCID[cid] ?? []
+            owners.remove(root)
+            if owners.isEmpty {
+                state.ownersByCID.removeValue(forKey: cid)
+                freedBytes += state.contentByCID.removeValue(forKey: cid)?.count ?? 0
+            } else {
+                state.ownersByCID[cid] = owners
+            }
+        }
+        state.insertedAt.removeValue(forKey: root)
+        state.lru.remove(root)
+        return freedBytes
     }
 
     public func pin(root: String, owner: String, count: Int, ttl: Duration?) async throws {
-        let expiresAt = ttl.map { ContinuousClock.Instant.now + $0 }
-        lock.withWriteLock {
-            if var entry = state.pins[root, default: [:]][owner] {
-                entry.count += count
+        guard count > 0 else { throw BrokerError.invalidPinCount }
+        if let ttl, ttl < .zero { throw BrokerError.invalidPinTTL }
+        let now = ContinuousClock.Instant.now
+        let expiresAt = ttl.map { now + $0 }
+        try lock.withWriteLock {
+            guard Self.isComplete(root: root, state: state) else {
+                throw BrokerError.notFound
+            }
+            if var entry = state.pins[root, default: [:]][owner],
+               entry.expiresAt.map({ now < $0 }) ?? true {
+                let (updated, overflow) = entry.count.addingReportingOverflow(count)
+                guard !overflow else { throw BrokerError.invalidPinCount }
+                entry.count = updated
                 if expiresAt == nil || entry.expiresAt == nil {
                     entry.expiresAt = nil
                 } else if let new = expiresAt, let old = entry.expiresAt, new > old {
@@ -118,6 +225,7 @@ public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRoot
     }
 
     public func unpin(root: String, owner: String, count: Int) async throws {
+        guard count > 0 else { throw BrokerError.invalidPinCount }
         lock.withWriteLock {
             guard var entry = state.pins[root]?[owner] else { return }
             entry.count -= count
@@ -169,55 +277,35 @@ public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRoot
         }
     }
 
-    public func advanceRetainedRoots(scope: String, roots: [String], operationID: String) async throws {
+    public func advanceRetainedRoots(scope: String, roots: [String]) async throws {
         let canonicalRoots = try Self.canonicalRetainedRoots(roots)
         guard !scope.isEmpty else {
-            throw BrokerError.invalidRetainedRootOperation("scope must not be empty")
-        }
-        guard !operationID.isEmpty else {
-            throw BrokerError.invalidRetainedRootOperation("operationID must not be empty")
+            throw BrokerError.invalidRetainedRoots("scope must not be empty")
         }
 
         try lock.withWriteLock {
-            if let existing = state.retainedRootOperations[operationID] {
-                guard existing.scope == scope && existing.payload == Self.operationPayload(kind: "replace", roots: canonicalRoots) else {
-                    throw BrokerError.conflictingRetainedRootOperation(operationID)
-                }
-                return
-            }
             for root in canonicalRoots {
-                try Self.validateRetainedClosure(root: root, state: state)
+                try Self.validateRetainedVolume(root: root, state: state)
             }
             state.retainedRoots[scope] = Set(canonicalRoots)
-            state.retainedRootOperations[operationID] = (scope, Self.operationPayload(kind: "replace", roots: canonicalRoots))
         }
     }
 
-    public func mergeRetainedRoots(scope: String, roots: [String], operationID: String) async throws {
+    public func mergeRetainedRoots(scope: String, roots: [String]) async throws {
         let canonicalRoots = try Self.canonicalRetainedRoots(roots)
         guard !scope.isEmpty else {
-            throw BrokerError.invalidRetainedRootOperation("scope must not be empty")
-        }
-        guard !operationID.isEmpty else {
-            throw BrokerError.invalidRetainedRootOperation("operationID must not be empty")
+            throw BrokerError.invalidRetainedRoots("scope must not be empty")
         }
 
         try lock.withWriteLock {
-            if let existing = state.retainedRootOperations[operationID] {
-                guard existing.scope == scope && existing.payload == Self.operationPayload(kind: "merge", roots: canonicalRoots) else {
-                    throw BrokerError.conflictingRetainedRootOperation(operationID)
-                }
-                return
-            }
             for root in canonicalRoots {
-                try Self.validateRetainedClosure(root: root, state: state)
+                try Self.validateRetainedVolume(root: root, state: state)
             }
             state.retainedRoots[scope, default: []].formUnion(canonicalRoots)
-            state.retainedRootOperations[operationID] = (scope, Self.operationPayload(kind: "merge", roots: canonicalRoots))
         }
     }
 
-    public func retainedRoots(scope: String) async -> [String] {
+    public func retainedRoots(scope: String) async throws -> [String] {
         guard !scope.isEmpty else { return [] }
         return lock.withReadLock {
             Array(state.retainedRoots[scope] ?? []).sorted()
@@ -236,87 +324,64 @@ public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRoot
                 if state.pins[root]?.isEmpty == true { state.pins.removeValue(forKey: root) }
             }
             let protected = Self.protectedRoots(state: state, now: now)
-            let unpinned = state.volumes.keys.filter { root in
+            let unpinned = state.membersByRoot.keys.filter { root in
                 if protected.contains(root) { return false }
                 guard let insertedAt = state.insertedAt[root] else { return true }
                 return insertedAt + evictUnpinnedGrace <= now
             }
             for root in unpinned {
-                state.volumes.removeValue(forKey: root)
-                state.insertedAt.removeValue(forKey: root)
-                state.lru.remove(root)
+                Self.removeVolume(root: root, state: &state)
             }
             return unpinned.count
         }
     }
 
-    private func evictIfOverCapacity() {
+    private func evictIfOverCapacity(protecting submittedRoots: Set<String>, state: inout State) {
         guard let capacity else { return }
         let now = ContinuousClock.Instant.now
-        lock.withWriteLock {
-            guard state.volumes.count > capacity else { return }
-            let protected = Self.protectedRoots(state: state, now: now)
-            var node = state.lru.oldest
-            while state.volumes.count > capacity, let current = node {
-                let key = current.key
-                let next = current.next
-                if !protected.contains(key) {
-                    state.volumes.removeValue(forKey: key)
-                    state.insertedAt.removeValue(forKey: key)
-                    state.pins.removeValue(forKey: key)
-                    state.lru.remove(key)
-                }
-                node = next
+        guard state.membersByRoot.count > capacity else { return }
+        let protected = Self.protectedRoots(state: state, now: now).union(submittedRoots)
+        var node = state.lru.oldest
+        while state.membersByRoot.count > capacity, let current = node {
+            let key = current.key
+            let next = current.next
+            if !protected.contains(key) {
+                Self.removeVolume(root: key, state: &state)
+                state.pins.removeValue(forKey: key)
             }
+            node = next
         }
     }
 
-    private func evictIfOverByteBudget() {
+    private func evictIfOverByteBudget(protecting submittedRoots: Set<String>, state: inout State) {
         guard let byteBudget else { return }
         let now = ContinuousClock.Instant.now
-        lock.withWriteLock {
-            var resident = Self.residentBytes(state.volumes)
-            guard resident > byteBudget else { return }
-            let protected = Self.protectedRoots(state: state, now: now)
-            var node = state.lru.oldest
-            while resident > byteBudget, let current = node {
-                let key = current.key
-                let next = current.next
-                if !protected.contains(key), let volume = state.volumes[key] {
-                    resident -= Self.payloadBytes(volume)
-                    state.volumes.removeValue(forKey: key)
-                    state.insertedAt.removeValue(forKey: key)
-                    state.pins.removeValue(forKey: key)
-                    state.lru.remove(key)
-                }
-                node = next
+        var resident = Self.residentBytes(state: state)
+        guard resident > byteBudget else { return }
+        let protected = Self.protectedRoots(state: state, now: now).union(submittedRoots)
+        var node = state.lru.oldest
+        while resident > byteBudget, let current = node {
+            let key = current.key
+            let next = current.next
+            if !protected.contains(key), state.membersByRoot[key] != nil {
+                resident -= Self.removeVolume(root: key, state: &state)
+                state.pins.removeValue(forKey: key)
             }
+            node = next
         }
     }
 
     private static func canonicalRetainedRoots(_ roots: [String]) throws -> [String] {
         let unique = Array(Set(roots))
         if unique.contains(where: { $0.isEmpty }) {
-            throw BrokerError.invalidRetainedRootOperation("roots must not contain empty strings")
+            throw BrokerError.invalidRetainedRoots("roots must not contain empty strings")
         }
         return unique.sorted()
     }
 
-    private static func operationPayload(kind: String, roots: [String]) -> String {
-        "\(kind):\(roots.joined(separator: "\n"))"
-    }
-
-    private static func validateRetainedClosure(root: String, state: State) throws {
-        var checked = Set<String>()
-        var queue = [root]
-        while let current = queue.popLast() {
-            guard checked.insert(current).inserted else { continue }
-            guard let volume = state.volumes[current], !volume.entries.isEmpty else {
-                throw BrokerError.missingRetainedRoot(current)
-            }
-            for cid in volume.entries.keys where state.volumes[cid] != nil {
-                queue.append(cid)
-            }
+    private static func validateRetainedVolume(root: String, state: State) throws {
+        guard isComplete(root: root, state: state) else {
+            throw BrokerError.missingRetainedRoot(root)
         }
     }
 
@@ -334,13 +399,6 @@ public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRoot
             protected.formUnion(roots)
         }
 
-        var queue = Array(protected)
-        while let root = queue.popLast() {
-            guard let volume = state.volumes[root] else { continue }
-            for cid in volume.entries.keys where protected.insert(cid).inserted {
-                queue.append(cid)
-            }
-        }
         return protected
     }
 }

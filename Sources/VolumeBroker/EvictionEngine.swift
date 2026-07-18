@@ -7,14 +7,9 @@ import VolumeBrokerSQLite
 
 /// Eviction engine.
 ///
-/// Reclaims storage for unpinned volumes: it first prunes pins whose TTL has
-/// expired, then deletes the CAS data, entries, and metadata for any root no
-/// longer referenced by a live pin or retained-root scope. Roots referenced by
-/// any remaining pin/retained root — and CAS blobs shared with them — are never
-/// evicted.
+/// Reclaims unpinned Volumes and then removes CAS rows with no surviving owner.
 struct EvictionEngine {
     let connection: SQLiteConnection
-    let negativeCache: NegativeCache
 
     func evictUnpinned(graceSeconds: Int = 600) async throws -> Int {
         try await connection.write {
@@ -24,107 +19,74 @@ struct EvictionEngine {
                 try connection.execBind("DELETE FROM volume_pins WHERE expires_at IS NOT NULL AND expires_at <= ?1") { stmt in
                     sqlite3_bind_text(stmt, 1, now, -1, SQLITE_TRANSIENT_SHIM)
                 }
-                let evictedRoots = unpinnedRoots(graceModifier: graceModifier, now: now)
-                // `protected` is the TRANSITIVE closure of cids reachable from a
-                // live pin or retained root: a root's entries, plus the entries
-                // of any reachable cid that is itself a volume root, recursively.
-                // The seed predicate is the same definition `PinIndex.isPinReachable`
-                // serves by, so the serve gate's TRUE set is always a subset of
-                // this protected set. (Expired pins are already deleted above;
-                // the TTL clause keeps the predicate self-contained.)
-                // `evictable` = roots that are NOT protected and past the grace.
-                try connection.execBind("""
-                    WITH RECURSIVE protected(cid) AS (
-                        SELECT DISTINCT root FROM volume_pins
-                        WHERE count > 0 AND (expires_at IS NULL OR expires_at > ?2)
-                        UNION
-                        SELECT root FROM retained_roots
-                        UNION
-                        SELECT ve.cid FROM volume_entries ve
-                        INNER JOIN protected pr ON ve.root = pr.cid
-                    ),
-                    evictable AS (
-                        SELECT root FROM volume_metadata
-                        WHERE root NOT IN (SELECT cid FROM protected)
-                          AND stored_at <= datetime('now', ?1)
-                    )
-                    DELETE FROM cas_data WHERE cid IN (
-                        SELECT ve.cid FROM volume_entries ve
-                        INNER JOIN evictable e ON ve.root = e.root
-                        WHERE ve.cid NOT IN (SELECT cid FROM protected)
-                    )
-                    """) { stmt in
-                    sqlite3_bind_text(stmt, 1, graceModifier, -1, SQLITE_TRANSIENT_SHIM)
-                    sqlite3_bind_text(stmt, 2, now, -1, SQLITE_TRANSIENT_SHIM)
+                let evictedRoots = try evictableRoots(
+                    graceModifier: graceModifier,
+                    now: now
+                )
+
+                for root in evictedRoots {
+                    try connection.execBind("DELETE FROM volume_entries WHERE root = ?1") { stmt in
+                        sqlite3_bind_text(stmt, 1, root, -1, SQLITE_TRANSIENT_SHIM)
+                    }
                 }
-                try connection.execBind("""
-                    WITH RECURSIVE protected(cid) AS (
-                        SELECT DISTINCT root FROM volume_pins
-                        WHERE count > 0 AND (expires_at IS NULL OR expires_at > ?2)
-                        UNION
-                        SELECT root FROM retained_roots
-                        UNION
-                        SELECT ve.cid FROM volume_entries ve
-                        INNER JOIN protected pr ON ve.root = pr.cid
-                    )
+                for root in evictedRoots {
+                    try connection.execBind("DELETE FROM volume_metadata WHERE root = ?1") { stmt in
+                        sqlite3_bind_text(stmt, 1, root, -1, SQLITE_TRANSIENT_SHIM)
+                    }
+                }
+                try connection.exec("""
                     DELETE FROM volume_entries
-                    WHERE root NOT IN (SELECT cid FROM protected)
-                      AND root IN (SELECT root FROM volume_metadata WHERE stored_at <= datetime('now', ?1))
-                    """) { stmt in
-                    sqlite3_bind_text(stmt, 1, graceModifier, -1, SQLITE_TRANSIENT_SHIM)
-                    sqlite3_bind_text(stmt, 2, now, -1, SQLITE_TRANSIENT_SHIM)
-                }
-                try connection.execBind("""
-                    WITH RECURSIVE protected(cid) AS (
-                        SELECT DISTINCT root FROM volume_pins
-                        WHERE count > 0 AND (expires_at IS NULL OR expires_at > ?2)
-                        UNION
-                        SELECT root FROM retained_roots
-                        UNION
-                        SELECT ve.cid FROM volume_entries ve
-                        INNER JOIN protected pr ON ve.root = pr.cid
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM volume_metadata vm
+                        WHERE vm.root = volume_entries.root
                     )
-                    DELETE FROM volume_metadata
-                    WHERE root NOT IN (SELECT cid FROM protected) AND stored_at <= datetime('now', ?1)
-                    """) { stmt in
-                    sqlite3_bind_text(stmt, 1, graceModifier, -1, SQLITE_TRANSIENT_SHIM)
-                    sqlite3_bind_text(stmt, 2, now, -1, SQLITE_TRANSIENT_SHIM)
-                }
+                    """)
+                try connection.exec("DELETE FROM volume_pins WHERE root NOT IN (SELECT root FROM volume_metadata)")
+                try connection.exec("""
+                    DELETE FROM cas_data
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM volume_entries ve WHERE ve.cid = cas_data.cid
+                    )
+                    """)
                 return evictedRoots
-            }
-            for root in evictedRoots {
-                negativeCache.recordEvicted(root)
             }
             return evictedRoots.count
         }
     }
 
-    private func unpinnedRoots(graceModifier: String, now: String) -> [String] {
+    private func evictableRoots(graceModifier: String, now: String) throws -> [String] {
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
         let sql = """
-            WITH RECURSIVE protected(cid) AS (
+            WITH live_roots(root) AS (
                 SELECT DISTINCT root FROM volume_pins
                 WHERE count > 0 AND (expires_at IS NULL OR expires_at > ?2)
                 UNION
                 SELECT root FROM retained_roots
-                UNION
-                SELECT ve.cid FROM volume_entries ve
-                INNER JOIN protected pr ON ve.root = pr.cid
             )
-            SELECT root FROM volume_metadata
-            WHERE root NOT IN (SELECT cid FROM protected)
-              AND stored_at <= datetime('now', ?1)
+            SELECT vm.root
+            FROM volume_metadata vm
+            WHERE NOT (\(CASVolumeStore.completeVolumePredicate))
+               OR (
+                    vm.root NOT IN (SELECT root FROM live_roots)
+                    AND vm.stored_at <= datetime('now', ?1)
+               )
             """
-        guard sqlite3_prepare_v2(connection.db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        guard sqlite3_prepare_v2(connection.db, sql, -1, &stmt, nil) == SQLITE_OK,
+              let stmt else {
+            throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
+        }
         sqlite3_bind_text(stmt, 1, graceModifier, -1, SQLITE_TRANSIENT_SHIM)
         sqlite3_bind_text(stmt, 2, now, -1, SQLITE_TRANSIENT_SHIM)
         var roots: [String] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            if let ptr = sqlite3_column_text(stmt, 0) {
-                roots.append(String(cString: ptr))
+        while true {
+            let result = sqlite3_step(stmt)
+            if result == SQLITE_DONE { return roots }
+            guard result == SQLITE_ROW, let ptr = sqlite3_column_text(stmt, 0) else {
+                throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(connection.db)))
             }
+            roots.append(String(cString: ptr))
         }
-        return roots
     }
+
 }

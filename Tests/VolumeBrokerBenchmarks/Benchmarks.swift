@@ -1,5 +1,7 @@
 import Testing
 import Foundation
+import CID
+import Multihash
 @testable import VolumeBroker
 
 private extension VolumeBroker {
@@ -11,15 +13,33 @@ private extension VolumeBroker {
 @Suite("Benchmarks")
 struct Benchmarks {
 
+    private enum BenchmarkError: Error {
+        case missingVolume(String)
+    }
+
     // MARK: - Helpers
 
+    private func cid(for data: Data) -> String {
+        let multihash = try! Multihash(raw: data, hashedWith: .sha2_256)
+        return try! CID(version: .v1, codec: .dag_cbor, multihash: multihash).toBaseEncodedString
+    }
+
+    private func cid(_ value: String) -> String {
+        cid(for: Data(value.utf8))
+    }
+
     private func payload(_ root: String, entryCount: Int, dataSize: Int = 64) -> SerializedVolume {
-        var entries: [String: Data] = [:]
+        let rootData = Data(root.utf8)
+        var entries = [cid(for: rootData): rootData]
         entries.reserveCapacity(entryCount)
-        for i in 0..<entryCount {
-            entries["\(root):cid-\(i)"] = Data(repeating: UInt8(i & 0xFF), count: dataSize)
+        for i in 1..<entryCount {
+            var data = Data("\(root):\(i):".utf8)
+            if data.count < dataSize {
+                data.append(Data(repeating: UInt8(i & 0xFF), count: dataSize - data.count))
+            }
+            entries[cid(for: data)] = data
         }
-        return SerializedVolume(root: root, entries: entries)
+        return SerializedVolume(root: cid(for: rootData), entries: entries)
     }
 
     private func tempDB() throws -> DiskBroker {
@@ -101,8 +121,13 @@ struct Benchmarks {
             try await broker.storeVolumeLocal(payload("r-\(i)", entryCount: 20))
         }
         print("\n--- DiskBroker: Fetch volumes (20 entries each) ---")
+        var index = 0
         try await measure("fetch 1000 times", iterations: 1000) {
-            let _ = await broker.fetchVolumeLocal(root: "r-\(Int.random(in: 0..<100))")
+            let root = cid("r-\(index % 100)")
+            index += 1
+            guard await broker.fetchVolumeLocal(root: root) != nil else {
+                throw BenchmarkError.missingVolume(root)
+            }
         }
     }
 
@@ -112,9 +137,47 @@ struct Benchmarks {
             try await broker.storeVolumeLocal(payload("r-\(i)", entryCount: 5))
         }
         print("\n--- DiskBroker: hasVolume checks ---")
+        var index = 0
+        var hits = 0
         try await measure("hasVolume 10000 checks", iterations: 10000) {
-            let _ = await broker.hasVolume(root: "r-\(Int.random(in: 0..<200))")
+            if await broker.hasVolume(root: cid("r-\(index % 200)")) { hits += 1 }
+            index += 1
         }
+        #expect(hits == 5_000)
+    }
+
+    @Test func largeVolumePresenceAndPointReadsAvoidWholeVolumeValidation() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VolumeBrokerPointRead-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let connection = try SQLiteConnection(path: directory.appendingPathComponent("volumes.sqlite").path)
+        let store = CASVolumeStore(connection: connection)
+        let volume = payload("point-read-scale", entryCount: 2_000, dataSize: 128)
+        let members = volume.entries.keys.filter { $0 != volume.root }.sorted()
+        let target = try #require(members.first)
+        let corruptSibling = try #require(members.last)
+        let expected = try #require(volume.entries[target])
+        try await store.storeVolumeLocal(volume)
+        try await connection.write {
+            try connection.exec("UPDATE cas_data SET data=X'00' WHERE cid='\(corruptSibling)'")
+        }
+
+        try await measure("large-volume structural presence", iterations: 100) {
+            guard await store.hasVolume(root: volume.root) else {
+                throw BenchmarkError.missingVolume(volume.root)
+            }
+        }
+        try await measure("large-volume point read", iterations: 1_000) {
+            guard await store.fetchDataLocal(cid: target) == expected else {
+                throw BenchmarkError.missingVolume(target)
+            }
+        }
+
+        #expect(await store.hasVolume(root: volume.root))
+        #expect(await store.fetchDataLocal(cid: target) == expected)
+        #expect(await store.fetchDataLocal(cid: corruptSibling) == nil)
+        #expect(await store.hasVolume(root: volume.root) == false)
     }
 
     // MARK: - DiskBroker Pin/Unpin
@@ -126,10 +189,10 @@ struct Benchmarks {
         }
         print("\n--- DiskBroker: Pin/unpin operations ---")
         try await measure("pin 1000 times", iterations: 1000) {
-            try await broker.pin(root: "r-\(Int.random(in: 0..<100))", owner: "owner-\(Int.random(in: 0..<10))")
+            try await broker.pin(root: cid("r-\(Int.random(in: 0..<100))"), owner: "owner-\(Int.random(in: 0..<10))")
         }
         try await measure("unpin 1000 times", iterations: 1000) {
-            try await broker.unpin(root: "r-\(Int.random(in: 0..<100))", owner: "owner-\(Int.random(in: 0..<10))")
+            try await broker.unpin(root: cid("r-\(Int.random(in: 0..<100))"), owner: "owner-\(Int.random(in: 0..<10))")
         }
     }
 
@@ -142,15 +205,15 @@ struct Benchmarks {
             try await broker.storeVolumeLocal(payload("r-\(i)", entryCount: 10))
         }
         for i in 0..<50 {
-            try await broker.pin(root: "r-\(i)", owner: "keeper")
+            try await broker.pin(root: cid("r-\(i)"), owner: "keeper")
         }
         try await measure("evict 450 unpinned volumes", iterations: 1) {
             // graceSeconds: 0 — exercise eviction mechanics, not the store-then-pin grace
             let evicted = try await broker.evictUnpinned(graceSeconds: 0)
             #expect(evicted == 450)
         }
-        #expect(await broker.hasVolume(root: "r-0"))
-        #expect(await broker.hasVolume(root: "r-499") == false)
+        #expect(await broker.hasVolume(root: cid("r-0")))
+        #expect(await broker.hasVolume(root: cid("r-499")) == false)
     }
 
     // MARK: - MemoryBroker LRU
@@ -158,13 +221,19 @@ struct Benchmarks {
     @Test func memoryLRUThroughput() async throws {
         let broker = MemoryBroker(capacity: 500)
         print("\n--- MemoryBroker: LRU store+fetch throughput (cap=500) ---")
+        var storeIndex = 0
         try await measure("store 5000 volumes", iterations: 5000) {
-            let p = payload("r-\(Int.random(in: 0..<10000))", entryCount: 5)
+            let p = payload("r-\(storeIndex)", entryCount: 5)
+            storeIndex += 1
             try await broker.storeVolumeLocal(p)
         }
+        var fetchIndex = 0
+        var hits = 0
         try await measure("fetch 5000 times", iterations: 5000) {
-            let _ = await broker.fetchVolumeLocal(root: "r-\(Int.random(in: 0..<10000))")
+            if await broker.fetchVolumeLocal(root: cid("r-\(fetchIndex)")) != nil { hits += 1 }
+            fetchIndex += 1
         }
+        #expect(hits == 500)
     }
 
     @Test func memoryLRUEviction() async throws {
@@ -174,7 +243,7 @@ struct Benchmarks {
             try await broker.storeVolumeLocal(payload("r-\(i)", entryCount: 5))
         }
         for i in 0..<100 {
-            try await broker.pin(root: "r-\(i)", owner: "keeper")
+            try await broker.pin(root: cid("r-\(i)"), owner: "keeper")
         }
         print("\n--- MemoryBroker: Evict 900 of 1000 volumes ---")
         try await measure("evictUnpinned", iterations: 1) {
@@ -204,17 +273,24 @@ struct Benchmarks {
         print("\n--- DiskBroker: Concurrent reads (4 tasks × 500 fetches) ---")
 
         let clock = ContinuousClock()
-        let elapsed = await clock.measure {
-            await withTaskGroup(of: Void.self) { group in
-                for _ in 0..<4 {
-                    group.addTask {
-                        for _ in 0..<500 {
-                            let _ = await broker.fetchVolumeLocal(root: "r-\(Int.random(in: 0..<200))")
-                        }
+        let start = clock.now
+        let successfulReads = await withTaskGroup(of: Int.self) { group in
+            for taskIndex in 0..<4 {
+                group.addTask {
+                    var hits = 0
+                    for iteration in 0..<500 {
+                        let index = (taskIndex * 500 + iteration) % 200
+                        if await broker.fetchVolumeLocal(root: cid("r-\(index)")) != nil { hits += 1 }
                     }
+                    return hits
                 }
             }
+            var total = 0
+            for await hits in group { total += hits }
+            return total
         }
+        let elapsed = start.duration(to: clock.now)
+        #expect(successfulReads == 2_000)
         let ms = Double(elapsed.components.attoseconds) / 1e15 + Double(elapsed.components.seconds) * 1000
         let opsPerSec = 2000.0 / (ms / 1000.0)
         print("  [4-way concurrent fetch] 2000 total fetches in \(String(format: "%.2f", ms))ms (\(String(format: "%.0f", opsPerSec)) ops/sec)")
@@ -228,24 +304,35 @@ struct Benchmarks {
         print("\n--- DiskBroker: Concurrent reads + writes (3 readers + 1 writer) ---")
 
         let clock = ContinuousClock()
-        let elapsed = await clock.measure {
-            await withTaskGroup(of: Void.self) { group in
-                for _ in 0..<3 {
-                    group.addTask {
-                        for _ in 0..<500 {
-                            let _ = await broker.fetchVolumeLocal(root: "r-\(Int.random(in: 0..<200))")
-                        }
-                    }
-                }
+        let start = clock.now
+        let successfulReads = try await withThrowingTaskGroup(of: Int.self) { group in
+            for taskIndex in 0..<3 {
                 group.addTask {
-                    for i in 200..<400 {
-                        try? await broker.storeVolumeLocal(
-                            SerializedVolume(root: "w-\(i)", entries: ["w-\(i):c": Data([UInt8(i & 0xFF)])])
-                        )
+                    var hits = 0
+                    for iteration in 0..<500 {
+                        let index = (taskIndex * 500 + iteration) % 200
+                        if await broker.fetchVolumeLocal(root: cid("r-\(index)")) != nil { hits += 1 }
                     }
+                    return hits
                 }
             }
+            group.addTask {
+                for i in 200..<400 {
+                    try await broker.storeVolumeLocal(payload("w-\(i)", entryCount: 2))
+                }
+                return 0
+            }
+            var total = 0
+            for try await hits in group { total += hits }
+            return total
         }
+        let elapsed = start.duration(to: clock.now)
+        #expect(successfulReads == 1_500)
+        var committedWrites = 0
+        for i in 200..<400 {
+            if await broker.hasVolume(root: cid("w-\(i)")) { committedWrites += 1 }
+        }
+        #expect(committedWrites == 200)
         let ms = Double(elapsed.components.attoseconds) / 1e15 + Double(elapsed.components.seconds) * 1000
         print("  [3 readers + 1 writer] completed in \(String(format: "%.2f", ms))ms")
     }
@@ -255,7 +342,7 @@ struct Benchmarks {
     @Test func cascadeFetchPerformance() async throws {
         let memory = MemoryBroker(capacity: 50)
         let disk = try tempDB()
-        await memory.link(near: disk)
+        memory.link(near: disk)
 
         for i in 0..<200 {
             try await disk.storeVolumeLocal(payload("r-\(i)", entryCount: 10))
@@ -265,8 +352,13 @@ struct Benchmarks {
         }
 
         print("\n--- Cascade: memory(50) → disk(200) fetch ---")
+        var index = 0
         try await measure("fetch 1000 (mix hit/miss)", iterations: 1000) {
-            let _ = await memory.fetchVolume(root: "r-\(Int.random(in: 0..<200))")
+            let root = cid("r-\(index % 200)")
+            index += 1
+            guard await memory.fetchVolume(root: root) != nil else {
+                throw BenchmarkError.missingVolume(root)
+            }
         }
     }
 }

@@ -2,9 +2,8 @@ import Foundation
 import ArrayTrie
 import cashew
 
-/// Object-level façade over a `VolumeBroker` tier chain: lattice-node deals in
-/// whole content **objects by root CID** and never touches `SerializedVolume`,
-/// individual entries, or cashew fetch/resolution mechanics directly.
+/// Object-level facade over a `VolumeBroker` tier chain for callers that deal in
+/// whole content objects by root CID rather than serialized Volume entries.
 public actor ContentStore {
     private let broker: any VolumeBroker
     private let source: BrokerFetcher
@@ -33,35 +32,47 @@ public actor ContentStore {
         await broker.fetchData(cid: rootCID) != nil
     }
 
-    public func hasDurable(_ rootCID: String) async -> Bool {
-        await broker.hasVolume(root: rootCID)
-    }
-
     // MARK: - Write
 
-    /// Store a whole object (recursively grouping it into volumes via the
-    /// store-side `VolumeAwareStorer`); returns its root CID.
+    /// Store a whole object and every materialized nested Volume.
     @discardableResult
     public func put<T: Node>(_ object: T) async throws -> String {
         let header = try VolumeImpl(node: object)
-        let storer = BrokerStorer(broker: broker)
-        try header.storeRecursively(storer: storer)
-        try await storer.flush(root: header.rawCID)
+        try await header.storeRecursively(storer: BrokerStorer(broker: broker))
+        return header.rawCID
+    }
+
+    /// Store a whole object and only the nested Volumes selected by `paths`.
+    @discardableResult
+    public func put<T: Node>(
+        _ object: T,
+        storing paths: ArrayTrie<StorageStrategy>
+    ) async throws -> String {
+        let header = try VolumeImpl(node: object)
+        try await header.store(paths: paths, storer: BrokerStorer(broker: broker))
+        return header.rawCID
+    }
+
+    /// Dictionary convenience matching Cashew's path-based storage API.
+    @discardableResult
+    public func put<T: Node>(
+        _ object: T,
+        storing paths: [[String]: StorageStrategy]
+    ) async throws -> String {
+        let header = try VolumeImpl(node: object)
+        try await header.store(paths: paths, storer: BrokerStorer(broker: broker))
         return header.rawCID
     }
 
     // MARK: - Retention
 
-    /// Retain an object under a reason (`owner`), refcounted. Pinning the object
-    /// root protects its whole reachable closure: eviction keeps the transitive
-    /// set of cids reachable from a pinned root, so a multi-volume object (e.g.
-    /// per-node state) is retained in full, not just the root node.
+    /// Retain one Volume root under a reason (`owner`), refcounted. Related Volume
+    /// roots are independent and must be retained explicitly by the application.
     public func retain(_ rootCID: String, owner: String) async throws {
         try await broker.pin(root: rootCID, owner: owner)
     }
 
-    /// Release one retention reason; the closure is evictable once no reason
-    /// (and no other pinned object's closure) keeps it.
+    /// Release one retention reason; this Volume is evictable once no reason keeps it.
     public func release(_ rootCID: String, owner: String) async throws {
         try await broker.unpin(root: rootCID, owner: owner)
     }

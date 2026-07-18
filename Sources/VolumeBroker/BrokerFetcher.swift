@@ -2,13 +2,11 @@ import Foundation
 import cashew
 
 /// Bridges a `VolumeBroker` tier chain to cashew resolution as a batched
-/// `ContentSource` (and a per-CID `Fetcher` for legacy callers).
+/// `ContentSource` and per-CID `Fetcher`.
 ///
-/// cashew 3.0.0 resolves over a batched `ContentSource`; the former
-/// `VolumeAwareFetcher` `enterVolume` bulk-prefetch + active-entry bookkeeping
-/// is gone — `CoalescingFetcher` now batches each resolution wave, so this just
+/// `CoalescingFetcher` batches each resolution wave, so this adapter
 /// answers content lookups against the broker chain via `fetchData(cid:)`
-/// (resolves any node by CID, not only volume roots).
+/// when a complete published Volume owns the requested CID.
 public actor BrokerFetcher: ContentSource, Fetcher {
     private let broker: any VolumeBroker
 
@@ -28,7 +26,7 @@ public actor BrokerFetcher: ContentSource, Fetcher {
         return out
     }
 
-    /// Per-CID (legacy `Fetcher`).
+    /// Per-CID `Fetcher` adapter.
     public func fetch(rawCid: String) async throws -> Data {
         guard let data = await broker.fetchData(cid: rawCid) else { throw BrokerError.notFound }
         return data

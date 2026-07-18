@@ -5,12 +5,10 @@ import Foundation
 /// `DiskBroker` composes the layered storage components and delegates to them;
 /// it owns no SQL itself. The layers are:
 ///   - `SQLiteConnection` — connection/PRAGMA/schema + serialised read/write access.
-///   - `NegativeCache`     — bloom + known-present negative-cache policy.
 ///   - `CASVolumeStore`    — content-addressed volume store (store/fetch/has).
-///   - `PinIndex`          — ref-counted pins, TTL, idempotent batch unpins.
+///   - `PinIndex`          — ref-counted pins, TTL, and batched updates.
 ///   - `RetainedRootIndex` — named durable retained-root sets.
 ///   - `EvictionEngine`    — TTL prune + unpinned CAS/entry/metadata reclaim.
-///   - `ChainMetaStore`    — chain metadata key/value store.
 public final class DiskBroker: @unchecked Sendable, VolumeBroker, RetainedRootBroker, RetainedRootMergeBroker {
     public var near: (any VolumeBroker)?
     public var far: (any VolumeBroker)?
@@ -20,18 +18,15 @@ public final class DiskBroker: @unchecked Sendable, VolumeBroker, RetainedRootBr
     private let pins: PinIndex
     private let retainedRoots: RetainedRootIndex
     private let eviction: EvictionEngine
-    private let chainMeta: ChainMetaStore
     private let evictUnpinnedGraceSeconds: Int
 
     public init(path: String, evictUnpinnedGraceSeconds: Int = 600) throws {
         let connection = try SQLiteConnection(path: path)
-        let negativeCache = NegativeCache()
         self.connection = connection
-        self.volumes = CASVolumeStore(connection: connection, negativeCache: negativeCache)
+        self.volumes = CASVolumeStore(connection: connection)
         self.pins = PinIndex(connection: connection)
         self.retainedRoots = RetainedRootIndex(connection: connection)
-        self.eviction = EvictionEngine(connection: connection, negativeCache: negativeCache)
-        self.chainMeta = ChainMetaStore(connection: connection)
+        self.eviction = EvictionEngine(connection: connection)
         self.evictUnpinnedGraceSeconds = evictUnpinnedGraceSeconds
     }
 
@@ -53,10 +48,6 @@ public final class DiskBroker: @unchecked Sendable, VolumeBroker, RetainedRootBr
         try await self.volumes.storeVolumesLocal(volumes)
     }
 
-    public func storeVolumeLocal(_ volume: SerializedVolume) async throws {
-        try await volumes.storeVolumeLocal(volume)
-    }
-
     // MARK: - Pins
 
     public func pinBatch(roots: [String], owner: String) async throws {
@@ -69,10 +60,6 @@ public final class DiskBroker: @unchecked Sendable, VolumeBroker, RetainedRootBr
 
     public func unpinBatch(items: [(root: String, owner: String, count: Int)]) async throws {
         try await pins.unpinBatch(items: items)
-    }
-
-    public func unpinBatchOnce(operationID: String, items: [(root: String, owner: String, count: Int)]) async throws {
-        try await pins.unpinBatchOnce(operationID: operationID, items: items)
     }
 
     public func unpin(root: String, owner: String, count: Int) async throws {
@@ -91,8 +78,7 @@ public final class DiskBroker: @unchecked Sendable, VolumeBroker, RetainedRootBr
         await pins.owners(root: root)
     }
 
-    /// True iff `cid` is pinned or reachable upward from a pinned root through
-    /// `volume_entries` — i.e. covered by some pinned object closure.
+    /// True iff `cid` is a pinned Volume root or a direct entry of one.
     public func isPinReachable(cid: String) async -> Bool {
         await pins.isPinReachable(cid: cid)
     }
@@ -109,30 +95,18 @@ public final class DiskBroker: @unchecked Sendable, VolumeBroker, RetainedRootBr
         await pins.pinnedOwners(prefix: prefix)
     }
 
-    public func deleteUnpinOperations(belowHeight: Int, prefix: String) async throws -> Int {
-        try await pins.deleteUnpinOperations(belowHeight: belowHeight, prefix: prefix)
-    }
-
-    public func unpinOperationCount(prefix: String? = nil) async -> Int {
-        await pins.unpinOperationCount(prefix: prefix)
-    }
-
-    public func deleteUnpinOperations(prefix: String) async throws -> Int {
-        try await pins.deleteUnpinOperations(prefix: prefix)
-    }
-
     // MARK: - Retained Roots
 
-    public func advanceRetainedRoots(scope: String, roots: [String], operationID: String) async throws {
-        try await retainedRoots.advanceRetainedRoots(scope: scope, roots: roots, operationID: operationID)
+    public func advanceRetainedRoots(scope: String, roots: [String]) async throws {
+        try await retainedRoots.advanceRetainedRoots(scope: scope, roots: roots)
     }
 
-    public func mergeRetainedRoots(scope: String, roots: [String], operationID: String) async throws {
-        try await retainedRoots.mergeRetainedRoots(scope: scope, roots: roots, operationID: operationID)
+    public func mergeRetainedRoots(scope: String, roots: [String]) async throws {
+        try await retainedRoots.mergeRetainedRoots(scope: scope, roots: roots)
     }
 
-    public func retainedRoots(scope: String) async -> [String] {
-        await retainedRoots.retainedRoots(scope: scope)
+    public func retainedRoots(scope: String) async throws -> [String] {
+        try await retainedRoots.retainedRoots(scope: scope)
     }
 
     // MARK: - Eviction
@@ -151,11 +125,4 @@ public final class DiskBroker: @unchecked Sendable, VolumeBroker, RetainedRootBr
 
     // MARK: - Chain Meta
 
-    public func getChainMeta(key: String) async -> String? {
-        await chainMeta.getChainMeta(key: key)
-    }
-
-    public func setChainMeta(key: String, value: String) async throws {
-        try await chainMeta.setChainMeta(key: key, value: value)
-    }
 }
