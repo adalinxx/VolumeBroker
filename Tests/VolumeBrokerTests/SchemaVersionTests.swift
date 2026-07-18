@@ -201,12 +201,27 @@ struct SchemaVersionTests {
         }
     }
 
-    @Test func nonemptyV0IsRejectedWithoutMutation() throws {
+    @Test func legacyV0StoreIsRejectedWithoutMutation() throws {
         let location = try temporaryDatabase()
         defer { try? FileManager.default.removeItem(at: location.directory) }
         try withDatabase(at: location.path) { db in
-            try execute(db, "CREATE TABLE legacy(value TEXT NOT NULL)")
-            try execute(db, "INSERT INTO legacy(value) VALUES('preserve-me')")
+            try execute(db, "CREATE TABLE cas_data (cid TEXT PRIMARY KEY, data BLOB NOT NULL)")
+            try execute(db, """
+                CREATE TABLE volume_entries (
+                    root TEXT NOT NULL,
+                    cid TEXT NOT NULL,
+                    PRIMARY KEY (root, cid)
+                )
+                """)
+            try execute(db, """
+                CREATE TABLE volume_metadata (
+                    root TEXT PRIMARY KEY,
+                    stored_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+                """)
+            try execute(db, "INSERT INTO cas_data(cid, data) VALUES('legacy-root', X'CAFE')")
+            try execute(db, "INSERT INTO volume_entries(root, cid) VALUES('legacy-root', 'legacy-root')")
+            try execute(db, "INSERT INTO volume_metadata(root) VALUES('legacy-root')")
         }
 
         do {
@@ -218,11 +233,17 @@ struct SchemaVersionTests {
 
         try withDatabase(at: location.path) { db in
             let version = try scalar(db, "PRAGMA user_version")
-            let legacyRows = try scalar(db, "SELECT COUNT(*) FROM legacy WHERE value='preserve-me'")
-            let brokerTables = try scalar(db, "SELECT COUNT(*) FROM sqlite_schema WHERE name='cas_data'")
+            let contentRows = try scalar(
+                db,
+                "SELECT COUNT(*) FROM cas_data WHERE cid='legacy-root'"
+            )
+            let metadataColumns = try scalar(
+                db,
+                "SELECT COUNT(*) FROM pragma_table_info('volume_metadata')"
+            )
             #expect(version == 0)
-            #expect(legacyRows == 1)
-            #expect(brokerTables == 0)
+            #expect(contentRows == 1)
+            #expect(metadataColumns == 2)
         }
     }
 

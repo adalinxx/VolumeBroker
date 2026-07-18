@@ -35,24 +35,6 @@ public protocol RetainedRootMergeBroker: RetainedRootBroker {
     func mergeRetainedRoots(scope: String, roots: [String]) async throws
 }
 
-public extension RetainedRootBroker {
-    /// `operationID` is ignored and retained only for temporary source compatibility.
-    @available(*, deprecated, message: "operationID is ignored; this overload exists only for temporary source compatibility")
-    func advanceRetainedRoots(scope: String, roots: [String], operationID: String) async throws {
-        _ = operationID
-        try await advanceRetainedRoots(scope: scope, roots: roots)
-    }
-}
-
-public extension RetainedRootMergeBroker {
-    /// `operationID` is ignored and retained only for temporary source compatibility.
-    @available(*, deprecated, message: "operationID is ignored; this overload exists only for temporary source compatibility")
-    func mergeRetainedRoots(scope: String, roots: [String], operationID: String) async throws {
-        _ = operationID
-        try await mergeRetainedRoots(scope: scope, roots: roots)
-    }
-}
-
 public extension VolumeBroker {
     func storeVolumeLocal(_ volume: SerializedVolume) async throws {
         try await storeVolumesLocal([volume])
