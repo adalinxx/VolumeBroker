@@ -367,7 +367,11 @@ struct CASVolumeStore {
         } else {
             throw BrokerError.sqlFailed("read existing content")
         }
-        guard existing == data else { throw BrokerError.conflictingContent(cid) }
+        guard existing != data else { return }
+        // Self-authenticating content is immutable; corrupt local bytes are repairable.
+        if (try? SerializedVolume.validate(cid: cid, data: existing)) != nil {
+            throw BrokerError.conflictingContent(cid)
+        }
     }
 
     private func insertMetadata(root: String, entryCount: Int) throws {
@@ -380,7 +384,13 @@ struct CASVolumeStore {
     }
 
     private func insertCASData(cid: String, data: Data) throws {
-        try connection.execBind("INSERT OR IGNORE INTO cas_data(cid, data) VALUES(?1, ?2)") { stmt in
+        try connection.execBind(
+            """
+            INSERT INTO cas_data(cid, data) VALUES(?1, ?2)
+            ON CONFLICT(cid) DO UPDATE SET data=excluded.data
+            WHERE cas_data.data != excluded.data
+            """
+        ) { stmt in
             sqlite3_bind_text(stmt, 1, cid, -1, SQLITE_TRANSIENT_SHIM)
             if data.isEmpty {
                 sqlite3_bind_zeroblob(stmt, 2, 0)

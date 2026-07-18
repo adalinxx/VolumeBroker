@@ -8,7 +8,7 @@ Retention never substitutes for publication.
 | VOLUME-001 | The declared root is present in the Volume. |
 | VOLUME-002 | Every `(CID, bytes)` pair uses the repository's canonical CID spelling and validates using its declared digest length. |
 | VOLUME-003 | A batch owns a copied snapshot and publishes all valid Volumes or none. |
-| VOLUME-004 | An existing CID cannot acquire different bytes. |
+| VOLUME-004 | Valid existing CID content cannot acquire different bytes; invalid local bytes may be repaired only by submitted bytes that authenticate to that CID. |
 | VOLUME-005 | An existing Volume root cannot acquire different membership. |
 | VOLUME-006 | Declared count, membership, owned CAS rows, root membership, and quarantine state must agree before publication. |
 | VOLUME-007 | Cashew completes one independently durable selected Volume per `VolumeStorer` callback; a caller with a preassembled all-or-none batch may use `storeVolumesLocal`. |

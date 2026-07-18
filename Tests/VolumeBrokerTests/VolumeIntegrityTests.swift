@@ -366,6 +366,59 @@ final class VolumeIntegrityTests: XCTestCase {
         }
     }
 
+    func testMemoryAndDiskShareTheVolumeLifecycleContract() async throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VolumeIntegrityTests-\(UUID().uuidString).sqlite").path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let brokers: [any RetainedRootBroker] = [
+            MemoryBroker(evictUnpinnedGrace: .zero),
+            try DiskBroker(path: path, evictUnpinnedGraceSeconds: 0),
+        ]
+        let rootData = Data("lifecycle-root".utf8)
+        let childData = Data("lifecycle-child".utf8)
+        let root = try cid(for: rootData)
+        let child = try cid(for: childData)
+        let volume = SerializedVolume(root: root, entries: [root: rootData, child: childData])
+
+        for broker in brokers {
+            let near = MemoryBroker()
+            let far = MemoryBroker()
+            broker.near = near
+            broker.far = far
+
+            try await broker.storeVolumeLocal(volume)
+            let present = await broker.hasVolume(root: root)
+            let fetched = await broker.fetchVolumeLocal(root: root)
+            let childBytes = await broker.fetchDataLocal(cid: child)
+            let nearPresent = await near.hasVolume(root: root)
+            let farPresent = await far.hasVolume(root: root)
+            XCTAssertTrue(present)
+            XCTAssertEqual(fetched?.entries, volume.entries)
+            XCTAssertEqual(childBytes, childData)
+            XCTAssertFalse(nearPresent)
+            XCTAssertFalse(farPresent)
+
+            try await broker.pin(root: root, owner: "lifecycle", count: 2)
+            let evictedWhilePinned = try await broker.evictUnpinned()
+            XCTAssertEqual(evictedWhilePinned, 0)
+            try await broker.unpin(root: root, owner: "lifecycle", count: 1)
+            let owners = await broker.owners(root: root)
+            XCTAssertEqual(owners, ["lifecycle"])
+
+            try await broker.advanceRetainedRoots(scope: "lifecycle", roots: [root])
+            try await broker.unpin(root: root, owner: "lifecycle", count: 1)
+            let evictedWhileRetained = try await broker.evictUnpinned()
+            XCTAssertEqual(evictedWhileRetained, 0)
+            try await broker.advanceRetainedRoots(scope: "lifecycle", roots: [])
+            let evictedAfterRelease = try await broker.evictUnpinned()
+            let presentAfterEviction = await broker.hasVolume(root: root)
+            let childAfterEviction = await broker.fetchDataLocal(cid: child)
+            XCTAssertEqual(evictedAfterRelease, 1)
+            XCTAssertFalse(presentAfterEviction)
+            XCTAssertNil(childAfterEviction)
+        }
+    }
+
     func testBrokersRejectConflictingVolumeMembershipWithoutMutation() async throws {
         let path = FileManager.default.temporaryDirectory
             .appendingPathComponent("VolumeIntegrityTests-\(UUID().uuidString).sqlite").path
@@ -489,14 +542,16 @@ final class VolumeIntegrityTests: XCTestCase {
         }
     }
 
-    func testSQLiteFailureAfterWritesRollsBackImmediatelyAndAfterReopen() async throws {
+    func testSQLiteBatchFailureAfterWritesRollsBackImmediatelyAndAfterReopen() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("VolumeIntegrityTests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let path = directory.appendingPathComponent("volumes.sqlite").path
-        let data = Data("rollback".utf8)
-        let root = try cid(for: data)
+        let firstData = Data("rollback-first".utf8)
+        let secondData = Data("rollback-second".utf8)
+        let firstRoot = try cid(for: firstData)
+        let secondRoot = try cid(for: secondData)
 
         do {
             let connection = try SQLiteConnection(path: path)
@@ -505,12 +560,16 @@ final class VolumeIntegrityTests: XCTestCase {
                 try connection.exec("""
                     CREATE TEMP TRIGGER fail_volume_entry
                     BEFORE INSERT ON volume_entries
+                    WHEN NEW.root = '\(secondRoot)'
                     BEGIN SELECT RAISE(ABORT, 'injected write failure'); END
                     """)
             }
 
             do {
-                try await store.storeVolumeLocal(SerializedVolume(root: root, entries: [root: data]))
+                try await store.storeVolumesLocal([
+                    SerializedVolume(root: firstRoot, entries: [firstRoot: firstData]),
+                    SerializedVolume(root: secondRoot, entries: [secondRoot: secondData]),
+                ])
                 XCTFail("the injected volume-entry failure must abort the transaction")
             } catch {
                 guard let brokerError = error as? BrokerError,
@@ -536,8 +595,11 @@ final class VolumeIntegrityTests: XCTestCase {
             }
         }
         XCTAssertEqual(reopenedCounts, [0, 0, 0])
-        let reopenedVolume = await CASVolumeStore(connection: reopened).fetchVolumeLocal(root: root)
-        XCTAssertNil(reopenedVolume)
+        let reopenedStore = CASVolumeStore(connection: reopened)
+        let reopenedFirst = await reopenedStore.fetchVolumeLocal(root: firstRoot)
+        let reopenedSecond = await reopenedStore.fetchVolumeLocal(root: secondRoot)
+        XCTAssertNil(reopenedFirst)
+        XCTAssertNil(reopenedSecond)
         try await assertHealthy(reopened)
     }
 
@@ -803,6 +865,51 @@ final class VolumeIntegrityTests: XCTestCase {
             )
         }
         XCTAssertEqual(quarantined, 0)
+    }
+
+    func testAuthenticatedRestorageRepairsCorruptCASBytes() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VolumeIntegrityTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let connection = try SQLiteConnection(path: directory.appendingPathComponent("volumes.sqlite").path)
+        let store = CASVolumeStore(connection: connection)
+        let firstData = Data("repair-first".utf8)
+        let secondData = Data("repair-second".utf8)
+        let sharedData = Data("repair-shared".utf8)
+        let first = try cid(for: firstData)
+        let second = try cid(for: secondData)
+        let shared = try cid(for: sharedData)
+        let firstVolume = SerializedVolume(
+            root: first,
+            entries: [first: firstData, shared: sharedData]
+        )
+        let secondVolume = SerializedVolume(
+            root: second,
+            entries: [second: secondData, shared: sharedData]
+        )
+        try await store.storeVolumeLocal(firstVolume)
+        try await connection.write {
+            try connection.exec("UPDATE cas_data SET data=X'00' WHERE cid='\(shared)'")
+        }
+
+        let corruptShared = await store.fetchDataLocal(cid: shared)
+        let firstAfterProof = await store.hasVolume(root: first)
+        XCTAssertNil(corruptShared)
+        XCTAssertFalse(firstAfterProof)
+
+        try await store.storeVolumeLocal(secondVolume)
+        let secondAfterRepair = await store.hasVolume(root: second)
+        let repairedShared = await store.fetchDataLocal(cid: shared)
+        let firstStillQuarantined = await store.hasVolume(root: first)
+        XCTAssertTrue(secondAfterRepair)
+        XCTAssertEqual(repairedShared, sharedData)
+        XCTAssertFalse(firstStillQuarantined)
+
+        try await store.storeVolumeLocal(firstVolume)
+        let firstAfterRestorage = await store.hasVolume(root: first)
+        XCTAssertTrue(firstAfterRestorage)
+        try await assertHealthy(connection)
     }
 
     func testOwnedCIDIsReadableButLooseCASRowIsInvisible() async throws {

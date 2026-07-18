@@ -232,10 +232,6 @@ struct EvictionEngineTests {
         #expect(try await retained.retainedRoots(scope: "canonical") == [root])
         #expect(try await retained.retainedRoots(scope: "candidate").isEmpty)
 
-        await #expect(throws: BrokerError.conflictingContent(root)) {
-            try await h.store.storeVolumeLocal(volume("corrupt"))
-        }
-
         #expect(try await h.eviction.evictUnpinned(graceSeconds: 60 * 60) == 1)
         #expect(await casRowCount(connection: h.connection, cid: root) == 0)
         #expect(await h.pins.owners(root: root).isEmpty)

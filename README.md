@@ -10,7 +10,7 @@ links or infers relationships between Volumes.
 ## Contract
 
 - A Volume is visible only after its complete, CID-valid entry set commits.
-- CID bytes and Volume membership are immutable.
+- Valid CID bytes and Volume membership are immutable.
 - Reads may fall through `local -> near -> far`; writes target one broker.
 - Pins and retained-root sets protect only the Volume roots named by the caller.
 - Equal CIDs are deduplicated within each broker tier.
@@ -92,7 +92,9 @@ owner is removed.
 
 - `MemoryBroker` supports count or byte limits and LRU eviction.
 - `DiskBroker` uses SQLite, WAL, foreign keys, deliberate `synchronous=FULL`
-  durability, and schema v1 validation.
+  durability, schema v1 validation, and quarantine for proved durable-byte
+  corruption. `MemoryBroker` needs no quarantine because its validated bytes
+  cannot change outside the broker.
 - `BrokerStorer` and `BrokerFetcher` connect Cashew storage and resolution.
 - `ContentStore` stores and resolves Cashew `Node` values by root CID.
 
@@ -116,7 +118,7 @@ contract.
 
 - Swift 6.0+
 - macOS 13+ or iOS 16+
-- Cashew 4.0.1+
+- Cashew 4.0.1
 
 ```sh
 swift build
