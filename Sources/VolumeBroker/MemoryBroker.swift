@@ -1,8 +1,8 @@
 import Foundation
 
-public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRootBroker, RetainedRootMergeBroker {
-    public var near: (any VolumeBroker)?
-    public var far: (any VolumeBroker)?
+public final class MemoryBroker: @unchecked Sendable, RetainedRootMergeBroker {
+    public let near: (any VolumeBroker)?
+    public let far: (any VolumeBroker)?
 
     private struct State {
         var contentByCID: [String: Data] = [:]
@@ -20,19 +20,33 @@ public final class MemoryBroker: @unchecked Sendable, VolumeBroker, RetainedRoot
     private let byteBudget: Int?
     private let evictUnpinnedGrace: Duration
 
-    public init(capacity: Int? = nil, evictUnpinnedGrace: Duration = .seconds(600)) {
+    public init(
+        capacity: Int? = nil,
+        evictUnpinnedGrace: Duration = .seconds(600),
+        near: (any VolumeBroker)? = nil,
+        far: (any VolumeBroker)? = nil
+    ) {
         self.capacity = capacity
         self.byteBudget = nil
         self.evictUnpinnedGrace = evictUnpinnedGrace
+        self.near = near
+        self.far = far
     }
 
     /// Bound resident memory by total volume payload bytes rather than by
     /// volume count. Unpinned LRU volumes are evicted until resident bytes
     /// fall back to `byteBudget`; pinned volumes are never evicted.
-    public init(byteBudget: Int, evictUnpinnedGrace: Duration = .seconds(600)) {
+    public init(
+        byteBudget: Int,
+        evictUnpinnedGrace: Duration = .seconds(600),
+        near: (any VolumeBroker)? = nil,
+        far: (any VolumeBroker)? = nil
+    ) {
         self.capacity = nil
         self.byteBudget = byteBudget
         self.evictUnpinnedGrace = evictUnpinnedGrace
+        self.near = near
+        self.far = far
     }
 
     /// Sum of unique content payload sizes currently resident.

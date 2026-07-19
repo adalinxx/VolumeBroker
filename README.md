@@ -23,9 +23,8 @@ data must be isolated.
 ```swift
 import VolumeBroker
 
-let memory = MemoryBroker(byteBudget: 64 * 1024 * 1024)
 let disk = try DiskBroker(path: "/var/lib/my-app/volumes.sqlite")
-memory.near = disk
+let memory = MemoryBroker(byteBudget: 64 * 1024 * 1024, near: disk)
 ```
 
 Reads now try memory and then disk. Stores remain explicit.

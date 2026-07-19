@@ -4,12 +4,6 @@ import CID
 import Multihash
 @testable import VolumeBroker
 
-private extension VolumeBroker {
-    func link(near: (any VolumeBroker)? = nil) {
-        self.near = near
-    }
-}
-
 @Suite("Benchmarks")
 struct Benchmarks {
 
@@ -340,9 +334,8 @@ struct Benchmarks {
     // MARK: - Cascade Fetch
 
     @Test func cascadeFetchPerformance() async throws {
-        let memory = MemoryBroker(capacity: 50)
         let disk = try tempDB()
-        memory.link(near: disk)
+        let memory = MemoryBroker(capacity: 50, near: disk)
 
         for i in 0..<200 {
             try await disk.storeVolumeLocal(payload("r-\(i)", entryCount: 10))

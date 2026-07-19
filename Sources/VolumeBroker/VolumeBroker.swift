@@ -3,8 +3,8 @@ import Foundation
 public protocol VolumeBroker: AnyObject, Sendable {
     /// Optional storage tiers in this broker's domain. Cross-chain sources use
     /// separate brokers and are coordinated by the node.
-    var near: (any VolumeBroker)? { get set }
-    var far: (any VolumeBroker)? { get set }
+    var near: (any VolumeBroker)? { get }
+    var far: (any VolumeBroker)? { get }
 
     func hasVolume(root: String) async -> Bool
     func fetchVolumeLocal(root: String) async -> SerializedVolume?

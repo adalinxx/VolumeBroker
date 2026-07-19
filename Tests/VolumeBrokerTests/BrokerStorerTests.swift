@@ -12,8 +12,8 @@ struct BrokerStorerTests {
     }
 
     private final class FlakyBroker: VolumeBroker, @unchecked Sendable {
-        var near: (any VolumeBroker)?
-        var far: (any VolumeBroker)?
+        let near: (any VolumeBroker)? = nil
+        let far: (any VolumeBroker)? = nil
         var failNextStore = true
         private(set) var attempts: [(root: String, entries: [String: Data])] = []
         let backing = MemoryBroker()

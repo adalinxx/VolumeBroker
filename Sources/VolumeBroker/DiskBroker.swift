@@ -9,9 +9,9 @@ import Foundation
 ///   - `PinIndex`          — ref-counted pins, TTL, and batched updates.
 ///   - `RetainedRootIndex` — named durable retained-root sets.
 ///   - `EvictionEngine`    — TTL prune + unpinned CAS/entry/metadata reclaim.
-public final class DiskBroker: @unchecked Sendable, VolumeBroker, RetainedRootBroker, RetainedRootMergeBroker {
-    public var near: (any VolumeBroker)?
-    public var far: (any VolumeBroker)?
+public final class DiskBroker: @unchecked Sendable, RetainedRootMergeBroker {
+    public let near: (any VolumeBroker)?
+    public let far: (any VolumeBroker)?
 
     private let connection: SQLiteConnection
     private let volumes: CASVolumeStore
@@ -20,7 +20,12 @@ public final class DiskBroker: @unchecked Sendable, VolumeBroker, RetainedRootBr
     private let eviction: EvictionEngine
     private let evictUnpinnedGraceSeconds: Int
 
-    public init(path: String, evictUnpinnedGraceSeconds: Int = 600) throws {
+    public init(
+        path: String,
+        evictUnpinnedGraceSeconds: Int = 600,
+        near: (any VolumeBroker)? = nil,
+        far: (any VolumeBroker)? = nil
+    ) throws {
         let connection = try SQLiteConnection(path: path)
         self.connection = connection
         self.volumes = CASVolumeStore(connection: connection)
@@ -28,6 +33,8 @@ public final class DiskBroker: @unchecked Sendable, VolumeBroker, RetainedRootBr
         self.retainedRoots = RetainedRootIndex(connection: connection)
         self.eviction = EvictionEngine(connection: connection)
         self.evictUnpinnedGraceSeconds = evictUnpinnedGraceSeconds
+        self.near = near
+        self.far = far
     }
 
     // MARK: - VolumeBroker
@@ -122,7 +129,5 @@ public final class DiskBroker: @unchecked Sendable, VolumeBroker, RetainedRootBr
     public func checkpoint() async {
         await connection.checkpoint()
     }
-
-    // MARK: - Chain Meta
 
 }

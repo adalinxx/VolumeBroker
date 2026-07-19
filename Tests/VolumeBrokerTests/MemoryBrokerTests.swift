@@ -402,20 +402,12 @@ struct MemoryBrokerTests {
     }
 
     @Test func cascadeFetchFallsThrough() async throws {
-        let local = MemoryBroker()
         let remote = MemoryBroker()
+        let local = MemoryBroker(near: remote)
         let p = payload("r1", ["c1": Data([42])])
         try await remote.storeVolumeLocal(p)
 
-        local.link(near: remote)
         let fetched = await local.fetchVolume(root: p.root)
         #expect(fetched?.entries[cid(for: Data([42]))] == Data([42]))
-    }
-}
-
-extension VolumeBroker {
-    func link(near: (any VolumeBroker)? = nil, far: (any VolumeBroker)? = nil) {
-        self.near = near
-        self.far = far
     }
 }
