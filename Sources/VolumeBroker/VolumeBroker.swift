@@ -12,6 +12,10 @@ public protocol VolumeBroker: AnyObject, Sendable {
     /// Volume owns it. The default handles the case where the CID is a root;
     /// CAS-backed brokers also resolve non-root members.
     func fetchDataLocal(cid: String) async -> Data?
+    /// Store content-addressed entries without declaring a Volume boundary.
+    /// Built-in brokers keep these as unowned CAS bytes until an explicit
+    /// complete Volume includes them.
+    func storeEntriesLocal(_ entries: [String: Data]) async throws
     func storeVolumesLocal(_ volumes: [SerializedVolume]) async throws
 
     func pin(root: String, owner: String, count: Int, ttl: Duration?) async throws
@@ -36,6 +40,12 @@ public protocol RetainedRootMergeBroker: RetainedRootBroker {
 }
 
 public extension VolumeBroker {
+    func storeEntriesLocal(_ entries: [String: Data]) async throws {
+        guard entries.isEmpty else {
+            throw BrokerError.inconsistentState("broker does not support raw CAS entry storage")
+        }
+    }
+
     func storeVolumeLocal(_ volume: SerializedVolume) async throws {
         try await storeVolumesLocal([volume])
     }

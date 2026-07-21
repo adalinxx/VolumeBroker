@@ -22,6 +22,13 @@ struct BrokerStorerTests {
         func fetchVolumeLocal(root: String) async -> SerializedVolume? {
             await backing.fetchVolumeLocal(root: root)
         }
+        func storeEntriesLocal(_ entries: [String: Data]) async throws {
+            if failNextStore {
+                failNextStore = false
+                throw InjectedFailure.store
+            }
+            try await backing.storeEntriesLocal(entries)
+        }
         func storeVolumesLocal(_ volumes: [SerializedVolume]) async throws {
             attempts.append(contentsOf: volumes.map { ($0.root, $0.entries) })
             if failNextStore {
@@ -77,14 +84,14 @@ struct BrokerStorerTests {
         try await BrokerStorer(broker: MemoryBroker(capacity: 0)).store(entries: [:])
     }
 
-    @Test func storesRawBatchAtomicallyAsSingletonVolumes() async throws {
+    @Test func storesRawBatchAtomicallyAsLooseCASEntries() async throws {
         let firstData = Data("first".utf8)
         let secondData = Data("second".utf8)
         let first = cid(for: firstData)
         let second = cid(for: secondData)
         let entries = [first: firstData, second: secondData]
 
-        let constrained = MemoryBroker(capacity: 1)
+        let constrained = MemoryBroker(byteBudget: firstData.count)
         do {
             try await BrokerStorer(broker: constrained).store(entries: entries)
             Issue.record("the whole batch must be rejected when it cannot fit")
@@ -96,8 +103,10 @@ struct BrokerStorerTests {
 
         let broker = MemoryBroker()
         try await BrokerStorer(broker: broker).store(entries: entries)
-        #expect(await broker.fetchVolumeLocal(root: first)?.entries == [first: firstData])
-        #expect(await broker.fetchVolumeLocal(root: second)?.entries == [second: secondData])
+        #expect(await broker.fetchVolumeLocal(root: first) == nil)
+        #expect(await broker.fetchVolumeLocal(root: second) == nil)
+        #expect(await broker.fetchDataLocal(cid: first) == firstData)
+        #expect(await broker.fetchDataLocal(cid: second) == secondData)
     }
 
     @Test func rawCIDMismatchRejectsWholeBatch() async throws {
@@ -129,7 +138,8 @@ struct BrokerStorerTests {
         try await storer.store(entries: [root: data])
         try await storer.store(entries: [root: data])
 
-        #expect(await broker.fetchVolumeLocal(root: root)?.entries == [root: data])
+        #expect(await broker.fetchVolumeLocal(root: root) == nil)
+        #expect(await broker.fetchDataLocal(cid: root) == data)
     }
 
     @Test func matchingRawRewritePreservesExistingCompleteMembership() async throws {
@@ -150,7 +160,7 @@ struct BrokerStorerTests {
         #expect(await broker.fetchVolumeLocal(root: root)?.entries == complete.entries)
     }
 
-    @Test func conflictingRawRewriteRejectsBeforePublishingNewSingletons() async throws {
+    @Test func conflictingRawRewriteRejectsBeforeStoringNewLooseEntries() async throws {
         let rootData = Data("complete-root".utf8)
         let childData = Data("complete-child".utf8)
         let newData = Data("new-singleton".utf8)
@@ -179,7 +189,7 @@ struct BrokerStorerTests {
         #expect(await broker.hasVolume(root: newRoot) == false)
     }
 
-    @Test func rawSingletonMembershipCannotBeWidened() async throws {
+    @Test func rawEntryCanBePublishedAsACompleteVolume() async throws {
         let rootData = Data("root".utf8)
         let childData = Data("child".utf8)
         let root = cid(for: rootData)
@@ -188,16 +198,12 @@ struct BrokerStorerTests {
         let storer = BrokerStorer(broker: broker)
 
         try await storer.store(entries: [root: rootData])
-        do {
-            try await storer.store(volume: SerializedVolume(
-                root: root,
-                entries: [root: rootData, child: childData]
-            ))
-            Issue.record("raw singleton membership must remain immutable")
-        } catch {
-            #expect(error as? BrokerError == .conflictingVolume(root))
-        }
-        #expect(await broker.fetchVolumeLocal(root: root)?.entries == [root: rootData])
+        let complete = SerializedVolume(
+            root: root,
+            entries: [root: rootData, child: childData]
+        )
+        try await storer.store(volume: complete)
+        #expect(await broker.fetchVolumeLocal(root: root)?.entries == complete.entries)
     }
 
     @Test func volumePayloadsRemainIndependent() async throws {

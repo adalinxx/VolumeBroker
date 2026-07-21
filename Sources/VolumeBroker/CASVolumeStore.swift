@@ -131,7 +131,8 @@ struct CASVolumeStore {
         return .volume(volume)
     }
 
-    /// A CAS row is readable only through at least one complete owning Volume.
+    /// Raw Cashew entries and entries owned by complete Volumes share the same
+    /// content-addressed byte store.
     func fetchDataLocal(cid: String) async -> Data? {
         let data: Data? = await connection.read {
             try? Self.loadServableData(cid: cid, db: connection.readDb)
@@ -149,19 +150,7 @@ struct CASVolumeStore {
     private static func loadServableData(cid: String, db: OpaquePointer) throws -> Data? {
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
-        let sql = """
-            SELECT cd.data
-            FROM cas_data cd
-            WHERE cd.cid = ?1
-              AND EXISTS (
-                  SELECT 1
-                  FROM volume_entries owner
-                  JOIN volume_metadata vm ON vm.root = owner.root
-                  WHERE owner.cid = cd.cid
-                    AND \(Self.completeVolumePredicate)
-              )
-            LIMIT 1
-            """
+        let sql = "SELECT data FROM cas_data WHERE cid = ?1 LIMIT 1"
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK,
               let stmt else {
             throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
@@ -205,6 +194,23 @@ struct CASVolumeStore {
 
     func storeVolumeLocal(_ volume: SerializedVolume) async throws {
         try await storeVolumesLocal([volume])
+    }
+
+    func storeEntriesLocal(_ entries: [String: Data]) async throws {
+        guard !entries.isEmpty else { return }
+        try await connection.write {
+            try connection.transaction {
+                for (cid, data) in entries {
+                    try validateExistingContent(cid: cid, data: data)
+                }
+                for (cid, data) in entries {
+                    try SerializedVolume.validate(cid: cid, data: data)
+                }
+                for (cid, data) in entries {
+                    try insertCASData(cid: cid, data: data)
+                }
+            }
+        }
     }
 
     func storeVolumesLocal(_ volumes: [SerializedVolume]) async throws {

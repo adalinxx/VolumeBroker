@@ -46,20 +46,18 @@ still an independent storage and retention unit. Cashew submits one Volume per
 storer callback; callers that already hold an all-or-none batch can use
 `storeVolumesLocal` to commit it in one transaction.
 
-For structures where every CID is itself a complete Volume boundary, adapt
-cashew's sparse `Storer` API explicitly:
+Cashew's sparse `Storer` API can materialize individual CAS entries without
+inventing a Volume boundary:
 
 ```swift
 let storer = BrokerStorer(broker: disk)
 try await header.storeRecursively(storer: storer)
 ```
 
-If an entry CID is already the root of a complete Volume and its root bytes
-match, the existing membership is preserved and the raw write is a no-op.
-Remaining entries are published in one atomic broker batch as
-`SerializedVolume(root: cid, entries: [cid: bytes])`. This adapter does not pin
-or retain roots. A raw-first singleton membership is permanent within the
-storage domain, so a later multi-entry Volume with the same root conflicts.
+These entries are readable by CID but are not published Volumes: `hasVolume`,
+whole-Volume fetch, pin, and retained-root admission ignore them. A later
+explicit `store(volume:)` reuses matching bytes and declares the immutable
+Volume membership. Raw entries are unretained and may be reclaimed by eviction.
 
 Resolve through the read cascade:
 

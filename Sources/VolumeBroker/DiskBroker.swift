@@ -51,6 +51,10 @@ public final class DiskBroker: @unchecked Sendable, RetainedRootMergeBroker {
         await volumes.fetchDataLocal(cid: cid)
     }
 
+    public func storeEntriesLocal(_ entries: [String: Data]) async throws {
+        try await volumes.storeEntriesLocal(entries)
+    }
+
     public func storeVolumesLocal(_ volumes: [SerializedVolume]) async throws {
         try await self.volumes.storeVolumesLocal(volumes)
     }
