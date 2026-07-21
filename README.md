@@ -46,6 +46,20 @@ still an independent storage and retention unit. Cashew submits one Volume per
 storer callback; callers that already hold an all-or-none batch can use
 `storeVolumesLocal` to commit it in one transaction.
 
+For structures where every CID is itself a complete Volume boundary, adapt
+cashew's sparse `Storer` API explicitly:
+
+```swift
+let storer = SingletonVolumeStorer(broker: disk)
+try await header.storeRecursively(storer: storer)
+```
+
+Each entry is published in one atomic broker batch as
+`SerializedVolume(root: cid, entries: [cid: bytes])`. This adapter does not pin
+or retain roots. Its singleton membership is permanent within the storage
+domain, so a later multi-entry Volume with the same root is a membership
+conflict; do not mix those models in one broker domain.
+
 Resolve through the read cascade:
 
 ```swift
@@ -92,7 +106,8 @@ owner is removed.
 - `MemoryBroker` supports count or byte limits and LRU eviction.
 - `DiskBroker` uses SQLite, WAL, foreign keys, deliberate `synchronous=FULL`
   durability, and schema v1 validation.
-- `BrokerStorer` and `BrokerFetcher` connect Cashew storage and resolution.
+- `BrokerStorer`, `SingletonVolumeStorer`, and `BrokerFetcher` connect Cashew
+  storage and resolution without combining complete and sparse write ports.
 - `ContentStore` stores and resolves Cashew `Node` values by root CID.
 
 `DiskBroker` initializes only an empty v0 database. A nonempty v0 store requires
