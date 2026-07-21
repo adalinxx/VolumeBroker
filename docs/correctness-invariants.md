@@ -23,7 +23,7 @@ Retention never substitutes for publication.
 | VOLUME-016 | Presence and pin reachability use the structural serve gate; a point read validates only its requested `(CID, bytes)`, while a whole-Volume read validates the whole Volume. |
 | VOLUME-017 | A proved read mismatch durably quarantines every manifest owning the mismatched CID without deleting bytes or intent; explicit eviction performs and counts reclamation. |
 | VOLUME-018 | SQLite WAL with `synchronous=FULL` is a deliberate durable-commit boundary. |
-| VOLUME-019 | `SingletonVolumeStorer` atomically maps each sparse `(CID, bytes)` entry to a permanent singleton Volume membership. It does not retain roots, and a later non-singleton Volume with the same root conflicts. |
+| VOLUME-019 | `BrokerStorer.store(entries:)` preserves an existing complete Volume when its root bytes match, then atomically maps each remaining sparse `(CID, bytes)` entry to a singleton Volume. Raw-first singleton membership is permanent and conflicts with a later wider Volume; complete-first matching raw writes are no-ops. Raw writes do not retain roots. `store(volume:)` preserves explicit complete boundaries. |
 
 Corruption is quarantined only after it is proved; a database error is not proof
 of corruption. Quarantine preserves pins and retained intent. Explicit eviction
@@ -32,5 +32,4 @@ so valid republication reactivates retained policy.
 
 Primary coverage: `VolumeIntegrityTests`, `MemoryBrokerTests`,
 `DiskBrokerTests`, `PinIndexTests`, `EvictionEngineTests`,
-`SchemaVersionTests`, `BrokerStorerTests`, `SingletonVolumeStorerTests`, and
-`ContentStoreTests`.
+`SchemaVersionTests`, `BrokerStorerTests`, and `ContentStoreTests`.
