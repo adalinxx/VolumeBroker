@@ -131,8 +131,7 @@ struct CASVolumeStore {
         return .volume(volume)
     }
 
-    /// Raw Cashew entries and entries owned by complete Volumes share the same
-    /// content-addressed byte store.
+    /// A CAS row is readable only through at least one complete owning Volume.
     func fetchDataLocal(cid: String) async -> Data? {
         let data: Data? = await connection.read {
             try? Self.loadServableData(cid: cid, db: connection.readDb)
@@ -150,7 +149,19 @@ struct CASVolumeStore {
     private static func loadServableData(cid: String, db: OpaquePointer) throws -> Data? {
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
-        let sql = "SELECT data FROM cas_data WHERE cid = ?1 LIMIT 1"
+        let sql = """
+            SELECT cd.data
+            FROM cas_data cd
+            WHERE cd.cid = ?1
+              AND EXISTS (
+                  SELECT 1
+                  FROM volume_entries owner
+                  JOIN volume_metadata vm ON vm.root = owner.root
+                  WHERE owner.cid = cd.cid
+                    AND \(Self.completeVolumePredicate)
+              )
+            LIMIT 1
+            """
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK,
               let stmt else {
             throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
@@ -194,23 +205,6 @@ struct CASVolumeStore {
 
     func storeVolumeLocal(_ volume: SerializedVolume) async throws {
         try await storeVolumesLocal([volume])
-    }
-
-    func storeEntriesLocal(_ entries: [String: Data]) async throws {
-        guard !entries.isEmpty else { return }
-        try await connection.write {
-            try connection.transaction {
-                for (cid, data) in entries {
-                    try validateExistingContent(cid: cid, data: data)
-                }
-                for (cid, data) in entries {
-                    try SerializedVolume.validate(cid: cid, data: data)
-                }
-                for (cid, data) in entries {
-                    try insertCASData(cid: cid, data: data)
-                }
-            }
-        }
     }
 
     func storeVolumesLocal(_ volumes: [SerializedVolume]) async throws {
@@ -373,7 +367,11 @@ struct CASVolumeStore {
         } else {
             throw BrokerError.sqlFailed("read existing content")
         }
-        guard existing == data else { throw BrokerError.conflictingContent(cid) }
+        guard existing != data else { return }
+        // Self-authenticating content is immutable; corrupt local bytes are repairable.
+        if (try? SerializedVolume.validate(cid: cid, data: existing)) != nil {
+            throw BrokerError.conflictingContent(cid)
+        }
     }
 
     private func insertMetadata(root: String, entryCount: Int) throws {
@@ -386,7 +384,13 @@ struct CASVolumeStore {
     }
 
     private func insertCASData(cid: String, data: Data) throws {
-        try connection.execBind("INSERT OR IGNORE INTO cas_data(cid, data) VALUES(?1, ?2)") { stmt in
+        try connection.execBind(
+            """
+            INSERT INTO cas_data(cid, data) VALUES(?1, ?2)
+            ON CONFLICT(cid) DO UPDATE SET data=excluded.data
+            WHERE cas_data.data != excluded.data
+            """
+        ) { stmt in
             sqlite3_bind_text(stmt, 1, cid, -1, SQLITE_TRANSIENT_SHIM)
             if data.isEmpty {
                 sqlite3_bind_zeroblob(stmt, 2, 0)

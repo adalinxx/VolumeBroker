@@ -10,7 +10,7 @@ links or infers relationships between Volumes.
 ## Contract
 
 - A Volume is visible only after its complete, CID-valid entry set commits.
-- CID bytes and Volume membership are immutable.
+- Valid CID bytes and Volume membership are immutable.
 - Reads may fall through `local -> near -> far`; writes target one broker.
 - Pins and retained-root sets protect only the Volume roots named by the caller.
 - Equal CIDs are deduplicated within each broker tier.
@@ -45,19 +45,6 @@ try await root.store(
 still an independent storage and retention unit. Cashew submits one Volume per
 storer callback; callers that already hold an all-or-none batch can use
 `storeVolumesLocal` to commit it in one transaction.
-
-Cashew's sparse `Storer` API can materialize individual CAS entries without
-inventing a Volume boundary:
-
-```swift
-let storer = BrokerStorer(broker: disk)
-try await header.storeRecursively(storer: storer)
-```
-
-These entries are readable by CID but are not published Volumes: `hasVolume`,
-whole-Volume fetch, pin, and retained-root admission ignore them. A later
-explicit `store(volume:)` reuses matching bytes and declares the immutable
-Volume membership. Raw entries are unretained and may be reclaimed by eviction.
 
 Resolve through the read cascade:
 
@@ -106,7 +93,6 @@ owner is removed.
 - `DiskBroker` uses SQLite, WAL, foreign keys, deliberate `synchronous=FULL`
   durability, and schema v1 validation.
 - `BrokerStorer` and `BrokerFetcher` connect Cashew storage and resolution.
-  `BrokerStorer` supports explicit complete-Volume and atomic sparse writes.
 - `ContentStore` stores and resolves Cashew `Node` values by root CID.
 
 `DiskBroker` initializes only an empty v0 database. A nonempty v0 store requires
@@ -129,7 +115,7 @@ contract.
 
 - Swift 6.0+
 - macOS 13+ or iOS 16+
-- Cashew 4.0.1+
+- Cashew 4.0.1
 
 ```sh
 swift build

@@ -8,7 +8,6 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootMergeBroker {
         var contentByCID: [String: Data] = [:]
         var membersByRoot: [String: Set<String>] = [:]
         var ownersByCID: [String: Set<String>] = [:]
-        var looseInsertedAt: [String: ContinuousClock.Instant] = [:]
         var insertedAt: [String: ContinuousClock.Instant] = [:]
         var pins: [String: [String: PinEntry]] = [:]
         var retainedRoots: [String: Set<String>] = [:]
@@ -76,32 +75,11 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootMergeBroker {
 
     public func fetchDataLocal(cid: String) async -> Data? {
         lock.withWriteLock {
-            guard let data = state.contentByCID[cid] else { return nil }
-            for root in state.ownersByCID[cid] ?? [] { state.lru.touch(root) }
+            guard let data = state.contentByCID[cid],
+                  let owners = state.ownersByCID[cid],
+                  !owners.isEmpty else { return nil }
+            for root in owners { state.lru.touch(root) }
             return data
-        }
-    }
-
-    public func storeEntriesLocal(_ entries: [String: Data]) async throws {
-        guard !entries.isEmpty else { return }
-        let insertedAt = ContinuousClock.Instant.now
-        try lock.withWriteLock {
-            for (cid, data) in entries {
-                if let existing = state.contentByCID[cid], existing != data {
-                    throw BrokerError.conflictingContent(cid)
-                }
-            }
-            for (cid, data) in entries {
-                try SerializedVolume.validate(cid: cid, data: data)
-            }
-            try ensureEntriesFit(entries, state: state)
-            for (cid, data) in entries where state.contentByCID[cid] == nil {
-                state.contentByCID[cid] = data
-                state.looseInsertedAt[cid] = insertedAt
-            }
-            let submittedCIDs = Set(entries.keys)
-            evictLooseIfOverByteBudget(protecting: submittedCIDs, state: &state)
-            evictIfOverByteBudget(protecting: [], state: &state)
         }
     }
 
@@ -121,7 +99,6 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootMergeBroker {
                 for (cid, data) in volume.entries {
                     state.contentByCID[cid] = data
                     state.ownersByCID[cid, default: []].insert(volume.root)
-                    state.looseInsertedAt.removeValue(forKey: cid)
                 }
             }
             for volume in volumes {
@@ -162,23 +139,6 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootMergeBroker {
             let (sum, overflow) = requiredBytes.addingReportingOverflow(data.count)
             if overflow { throw BrokerError.capacityExceeded }
             requiredBytes = sum
-        }
-        if requiredBytes > byteBudget { throw BrokerError.capacityExceeded }
-    }
-
-    private func ensureEntriesFit(_ entries: [String: Data], state: State) throws {
-        guard let byteBudget else { return }
-        var requiredCIDs = Set(entries.keys)
-        for root in Self.protectedRoots(state: state, now: .now) {
-            requiredCIDs.formUnion(state.membersByRoot[root] ?? [])
-        }
-        let requiredBytes = try requiredCIDs.reduce(into: 0) { total, cid in
-            guard let data = entries[cid] ?? state.contentByCID[cid] else {
-                throw BrokerError.inconsistentState("protected CID \(cid) has no resident bytes")
-            }
-            let (sum, overflow) = total.addingReportingOverflow(data.count)
-            if overflow { throw BrokerError.capacityExceeded }
-            total = sum
         }
         if requiredBytes > byteBudget { throw BrokerError.capacityExceeded }
     }
@@ -386,12 +346,6 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootMergeBroker {
             for root in unpinned {
                 Self.removeVolume(root: root, state: &state)
             }
-            for cid in state.looseInsertedAt.compactMap({ cid, insertedAt in
-                insertedAt + evictUnpinnedGrace <= now ? cid : nil
-            }) {
-                state.looseInsertedAt.removeValue(forKey: cid)
-                state.contentByCID.removeValue(forKey: cid)
-            }
             return unpinned.count
         }
     }
@@ -428,15 +382,6 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootMergeBroker {
                 state.pins.removeValue(forKey: key)
             }
             node = next
-        }
-    }
-
-    private func evictLooseIfOverByteBudget(protecting submittedCIDs: Set<String>, state: inout State) {
-        guard let byteBudget else { return }
-        for (cid, _) in state.looseInsertedAt.sorted(by: { $0.value < $1.value })
-        where Self.residentBytes(state: state) > byteBudget && !submittedCIDs.contains(cid) {
-            state.looseInsertedAt.removeValue(forKey: cid)
-            state.contentByCID.removeValue(forKey: cid)
         }
     }
 

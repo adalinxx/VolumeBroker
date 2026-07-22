@@ -36,7 +36,7 @@ final class SQLiteConnection: @unchecked Sendable {
             throw BrokerError.openFailed(msg)
         }
         do {
-            try Self.execRaw(db: handle, "PRAGMA busy_timeout=5000")
+            try Self.execRaw(db: handle, "PRAGMA busy_timeout=30000")
             try Self.execRaw(db: handle, "PRAGMA auto_vacuum=INCREMENTAL")
             try Self.initializeSchemaIfNeeded(db: handle)
             try Self.configureWriteConnection(db: handle)
