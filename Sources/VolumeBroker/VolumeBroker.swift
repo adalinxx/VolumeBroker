@@ -40,10 +40,14 @@ public protocol RetainedRootMergeBroker: RetainedRootBroker {
 }
 
 public extension VolumeBroker {
+    /// Convenience fallback for brokers without a native batch transaction.
+    /// A thrown error may leave a successfully applied prefix pinned.
     func pinBatch(roots: [String], owner: String) async throws {
         for root in roots { try await pin(root: root, owner: owner) }
     }
 
+    /// Convenience fallback for brokers without a native batch transaction.
+    /// A thrown error may leave a successfully applied prefix unpinned.
     func unpinBatch(
         items: [(root: String, owner: String, count: Int)]
     ) async throws {

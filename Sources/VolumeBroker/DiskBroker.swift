@@ -61,6 +61,7 @@ public final class DiskBroker: @unchecked Sendable, RetainedRootMergeBroker {
 
     // MARK: - Pins
 
+    /// Applies the complete batch in one pin-index transaction.
     public func pinBatch(roots: [String], owner: String) async throws {
         try await pins.pinBatch(roots: roots, owner: owner)
     }
@@ -69,6 +70,7 @@ public final class DiskBroker: @unchecked Sendable, RetainedRootMergeBroker {
         try await pins.pin(root: root, owner: owner, count: count, ttl: ttl)
     }
 
+    /// Applies the complete batch in one pin-index transaction.
     public func unpinBatch(items: [(root: String, owner: String, count: Int)]) async throws {
         try await pins.unpinBatch(items: items)
     }
