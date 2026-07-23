@@ -17,7 +17,9 @@ public protocol VolumeBroker: AnyObject, Sendable {
     func storeVolumesLocal(_ volumes: [SerializedVolume]) async throws
 
     func pin(root: String, owner: String, count: Int, ttl: Duration?) async throws
+    func pinBatch(roots: [String], owner: String) async throws
     func unpin(root: String, owner: String, count: Int) async throws
+    func unpinBatch(items: [(root: String, owner: String, count: Int)]) async throws
     func unpinAll(owner: String) async throws
     func owners(root: String) async -> Set<String>
     func evictUnpinned() async throws -> Int
@@ -38,6 +40,22 @@ public protocol RetainedRootMergeBroker: RetainedRootBroker {
 }
 
 public extension VolumeBroker {
+    func pinBatch(roots: [String], owner: String) async throws {
+        for root in roots { try await pin(root: root, owner: owner) }
+    }
+
+    func unpinBatch(
+        items: [(root: String, owner: String, count: Int)]
+    ) async throws {
+        for item in items {
+            try await unpin(
+                root: item.root,
+                owner: item.owner,
+                count: item.count
+            )
+        }
+    }
+
     func storeVolumeLocal(_ volume: SerializedVolume) async throws {
         try await storeVolumesLocal([volume])
     }
