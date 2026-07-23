@@ -32,4 +32,4 @@ so valid republication reactivates retained policy.
 
 Primary coverage: `VolumeIntegrityTests`, `MemoryBrokerTests`,
 `DiskBrokerTests`, `PinIndexTests`, `EvictionEngineTests`,
-`SchemaVersionTests`, `BrokerStorerTests`, and `BrokerFetcherTests`.
+`SchemaVersionTests`, and `CashewProtocolTests`.

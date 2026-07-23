@@ -1,4 +1,5 @@
 import Foundation
+import cashew
 #if canImport(SQLite3)
 import SQLite3
 #else
@@ -6,7 +7,7 @@ import VolumeBrokerSQLite
 #endif
 
 /// Content-addressed storage for complete published Volumes.
-struct CASVolumeStore {
+struct CASVolumeStore: VolumeStorer {
     private static let maximumReadParameters = 500
     let connection: SQLiteConnection
 
@@ -267,7 +268,7 @@ struct CASVolumeStore {
         }
     }
 
-    func storeVolumeLocal(_ volume: SerializedVolume) async throws {
+    func store(volume: SerializedVolume) async throws {
         try await storeVolumesLocal([volume])
     }
 

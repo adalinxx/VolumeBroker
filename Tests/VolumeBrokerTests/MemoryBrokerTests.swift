@@ -45,7 +45,7 @@ struct MemoryBrokerTests {
         let volume = payload("too-large")
 
         do {
-            try await broker.storeVolumeLocal(volume)
+            try await broker.store(volume: volume)
             Issue.record("volume larger than byte budget must fail")
         } catch {
             #expect(error as? BrokerError == .capacityExceeded)
@@ -64,7 +64,7 @@ struct MemoryBrokerTests {
         let root = cid(for: borrowed)
         let broker = MemoryBroker()
 
-        try await broker.storeVolumeLocal(SerializedVolume(root: root, entries: [root: borrowed]))
+        try await broker.store(volume: SerializedVolume(root: root, entries: [root: borrowed]))
         let bytes = pointer.bindMemory(to: UInt8.self, capacity: count)
         for index in 0..<count { bytes[index] = 9 }
 
@@ -81,11 +81,11 @@ struct MemoryBrokerTests {
         let thirdKiB = Data(repeating: 3, count: 1024)
         let budget = 2300
         let broker = MemoryBroker(byteBudget: budget)
-        try await broker.storeVolumeLocal(payload("A", ["A": firstKiB]))
-        try await broker.storeVolumeLocal(payload("B", ["B": secondKiB]))
+        try await broker.store(volume: payload("A", ["A": firstKiB]))
+        try await broker.store(volume: payload("B", ["B": secondKiB]))
         _ = await broker.fetchDataLocal(cid: cid(for: firstKiB))
         // Storing C pushes over budget → the coldest UNPINNED volume is evicted.
-        try await broker.storeVolumeLocal(payload("C", ["C": thirdKiB]))
+        try await broker.store(volume: payload("C", ["C": thirdKiB]))
         #expect(await broker.fetchVolumeLocal(root: cid("A")) != nil)  // recently read → survives
         #expect(await broker.fetchVolumeLocal(root: cid("B")) == nil)  // coldest → evicted
         #expect(await broker.fetchVolumeLocal(root: cid("C")) != nil)  // newest → present
@@ -95,7 +95,7 @@ struct MemoryBrokerTests {
     @Test func storeAndFetch() async throws {
         let broker = MemoryBroker()
         let p = payload("r1", ["c1": Data([1]), "c2": Data([2])])
-        try await broker.storeVolumeLocal(p)
+        try await broker.store(volume: p)
 
         #expect(await broker.hasVolume(root: p.root))
         let fetched = await broker.fetchVolumeLocal(root: p.root)
@@ -124,7 +124,7 @@ struct MemoryBrokerTests {
         let uniqueBytes = firstRootData.count + secondRootData.count + sharedData.count
         #expect(await broker.residentBytes() == uniqueBytes)
 
-        try await broker.storeVolumeLocal(first)
+        try await broker.store(volume: first)
         #expect(await broker.residentBytes() == uniqueBytes)
 
         try await broker.pin(root: firstRoot, owner: "owner")
@@ -154,7 +154,7 @@ struct MemoryBrokerTests {
         }
 
         let root = cid("r1")
-        try await broker.storeVolumeLocal(payload("r1"))
+        try await broker.store(volume: payload("r1"))
         for count in [0, -1] {
             do {
                 try await broker.pin(root: root, owner: "owner", count: count)
@@ -176,7 +176,7 @@ struct MemoryBrokerTests {
     @Test func pinAndUnpin() async throws {
         let broker = MemoryBroker()
         let root = cid("r1")
-        try await broker.storeVolumeLocal(payload("r1"))
+        try await broker.store(volume: payload("r1"))
         try await broker.pin(root: root, owner: "chain-a")
         try await broker.pin(root: root, owner: "chain-b")
         #expect(await broker.owners(root: root) == ["chain-a", "chain-b"])
@@ -191,7 +191,7 @@ struct MemoryBrokerTests {
     @Test func refCountedPins() async throws {
         let broker = MemoryBroker()
         let root = cid("r1")
-        try await broker.storeVolumeLocal(payload("r1"))
+        try await broker.store(volume: payload("r1"))
         try await broker.pin(root: root, owner: "chain-a")
         try await broker.pin(root: root, owner: "chain-a")
 
@@ -209,7 +209,7 @@ struct MemoryBrokerTests {
     @Test func pinWithExplicitCount() async throws {
         let broker = MemoryBroker()
         let root = cid("r1")
-        try await broker.storeVolumeLocal(payload("r1"))
+        try await broker.store(volume: payload("r1"))
         try await broker.pin(root: root, owner: "chain-a", count: 5)
         try await broker.unpin(root: root, owner: "chain-a", count: 3)
         #expect(await broker.owners(root: root) == ["chain-a"])
@@ -221,7 +221,7 @@ struct MemoryBrokerTests {
     @Test func unpinMoreThanCountRemovesPin() async throws {
         let broker = MemoryBroker()
         let root = cid("r1")
-        try await broker.storeVolumeLocal(payload("r1"))
+        try await broker.store(volume: payload("r1"))
         try await broker.pin(root: root, owner: "chain-a", count: 2)
         try await broker.unpin(root: root, owner: "chain-a", count: 10)
         #expect(await broker.owners(root: root).isEmpty)
@@ -243,8 +243,8 @@ struct MemoryBrokerTests {
         let broker = MemoryBroker(evictUnpinnedGrace: .zero)
         let keep = cid("r1")
         let drop = cid("r2")
-        try await broker.storeVolumeLocal(payload("r1"))
-        try await broker.storeVolumeLocal(payload("r2"))
+        try await broker.store(volume: payload("r1"))
+        try await broker.store(volume: payload("r2"))
         try await broker.pin(root: keep, owner: "chain-a")
 
         let evicted = try await broker.evictUnpinned()
@@ -257,8 +257,8 @@ struct MemoryBrokerTests {
         let broker = MemoryBroker(evictUnpinnedGrace: .zero)
         let keep = cid("keep")
         let drop = cid("drop")
-        try await broker.storeVolumeLocal(payload("keep"))
-        try await broker.storeVolumeLocal(payload("drop"))
+        try await broker.store(volume: payload("keep"))
+        try await broker.store(volume: payload("drop"))
 
         try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [keep])
 
@@ -273,7 +273,7 @@ struct MemoryBrokerTests {
     @Test func retainedRootReplaceIsNaturallyIdempotent() async throws {
         let broker = MemoryBroker(evictUnpinnedGrace: .zero)
         let r1 = cid("r1")
-        try await broker.storeVolumeLocal(payload("r1"))
+        try await broker.store(volume: payload("r1"))
 
         try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [r1])
         try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [r1])
@@ -286,9 +286,9 @@ struct MemoryBrokerTests {
         let old = cid("old")
         let new = cid("new")
         let drop = cid("drop")
-        try await broker.storeVolumeLocal(payload("old"))
-        try await broker.storeVolumeLocal(payload("new"))
-        try await broker.storeVolumeLocal(payload("drop"))
+        try await broker.store(volume: payload("old"))
+        try await broker.store(volume: payload("new"))
+        try await broker.store(volume: payload("drop"))
 
         try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [old])
         try await broker.mergeRetainedRoots(scope: "chain-a:state", roots: [new])
@@ -305,7 +305,7 @@ struct MemoryBrokerTests {
     @Test func retainedRootDoesNotRequireRelatedVolume() async throws {
         let broker = MemoryBroker(evictUnpinnedGrace: .zero)
         let root = cid("root")
-        try await broker.storeVolumeLocal(payload("root"))
+        try await broker.store(volume: payload("root"))
 
         try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [root])
 
@@ -315,7 +315,7 @@ struct MemoryBrokerTests {
     @Test func evictUnpinnedRespectsStoreThenPinGrace() async throws {
         let broker = MemoryBroker(evictUnpinnedGrace: .seconds(600))
         let root = cid("fresh")
-        try await broker.storeVolumeLocal(payload("fresh"))
+        try await broker.store(volume: payload("fresh"))
 
         let evicted = try await broker.evictUnpinned()
         #expect(evicted == 0)
@@ -325,7 +325,7 @@ struct MemoryBrokerTests {
     @Test func ttlExpiredOwnerAutoRemoved() async throws {
         let broker = MemoryBroker(evictUnpinnedGrace: .zero)
         let root = cid("r1")
-        try await broker.storeVolumeLocal(payload("r1"))
+        try await broker.store(volume: payload("r1"))
         try await broker.pin(root: root, owner: "chain-a:42", ttl: .zero)
 
         #expect(await broker.owners(root: root).isEmpty)
@@ -336,7 +336,7 @@ struct MemoryBrokerTests {
     @Test func ttlExpiredButOtherOwnerKeepsAlive() async throws {
         let broker = MemoryBroker()
         let root = cid("r1")
-        try await broker.storeVolumeLocal(payload("r1"))
+        try await broker.store(volume: payload("r1"))
         try await broker.pin(root: root, owner: "chain-a:42", ttl: .zero)
         try await broker.pin(root: root, owner: "chain-b:tip")
 
@@ -349,7 +349,7 @@ struct MemoryBrokerTests {
     @Test func noTTLMeansIndefinite() async throws {
         let broker = MemoryBroker()
         let root = cid("r1")
-        try await broker.storeVolumeLocal(payload("r1"))
+        try await broker.store(volume: payload("r1"))
         try await broker.pin(root: root, owner: "chain-a:tip")
 
         let evicted = try await broker.evictUnpinned()
@@ -381,9 +381,9 @@ struct MemoryBrokerTests {
         let r1 = cid("r1")
         let r2 = cid("r2")
         let r3 = cid("r3")
-        try await broker.storeVolumeLocal(payload("r1"))
-        try await broker.storeVolumeLocal(payload("r2"))
-        try await broker.storeVolumeLocal(payload("r3"))
+        try await broker.store(volume: payload("r1"))
+        try await broker.store(volume: payload("r2"))
+        try await broker.store(volume: payload("r3"))
 
         #expect(await broker.hasVolume(root: r1) == false)
         #expect(await broker.hasVolume(root: r2))
@@ -393,10 +393,10 @@ struct MemoryBrokerTests {
     @Test func pinnedSurvivesCapacityEviction() async throws {
         let broker = MemoryBroker(capacity: 2)
         let r1 = cid("r1")
-        try await broker.storeVolumeLocal(payload("r1"))
+        try await broker.store(volume: payload("r1"))
         try await broker.pin(root: r1, owner: "chain-a")
-        try await broker.storeVolumeLocal(payload("r2"))
-        try await broker.storeVolumeLocal(payload("r3"))
+        try await broker.store(volume: payload("r2"))
+        try await broker.store(volume: payload("r3"))
 
         #expect(await broker.hasVolume(root: r1))
     }
@@ -405,7 +405,7 @@ struct MemoryBrokerTests {
         let remote = MemoryBroker()
         let local = MemoryBroker(near: remote)
         let p = payload("r1", ["c1": Data([42])])
-        try await remote.storeVolumeLocal(p)
+        try await remote.store(volume: p)
 
         let fetched = await local.fetchVolume(root: p.root)
         #expect(fetched?.entries[cid(for: Data([42]))] == Data([42]))
@@ -418,9 +418,9 @@ struct MemoryBrokerTests {
         let localVolume = payload("local")
         let nearVolume = payload("near")
         let farVolume = payload("far")
-        try await local.storeVolumeLocal(localVolume)
-        try await near.storeVolumeLocal(nearVolume)
-        try await far.storeVolumeLocal(farVolume)
+        try await local.store(volume: localVolume)
+        try await near.store(volume: nearVolume)
+        try await far.store(volume: farVolume)
 
         let found = await local.fetchData(cids: [
             localVolume.root, nearVolume.root, farVolume.root, "missing",

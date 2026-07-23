@@ -1,6 +1,7 @@
 import Foundation
+import cashew
 
-public protocol VolumeBroker: AnyObject, Sendable {
+public protocol VolumeBroker: AnyObject, VolumeStorer, ContentSource, Fetcher {
     /// Optional storage tiers in this broker's domain. Cross-chain sources use
     /// separate brokers and are coordinated by the node.
     var near: (any VolumeBroker)? { get }
@@ -40,6 +41,21 @@ public protocol RetainedRootMergeBroker: RetainedRootBroker {
 }
 
 public extension VolumeBroker {
+    func store(volume: SerializedVolume) async throws {
+        try await storeVolumesLocal([volume])
+    }
+
+    func fetch(_ cids: Set<String>) async -> [String: Data] {
+        await fetchData(cids: Set(cids.filter { !$0.isEmpty }))
+    }
+
+    func fetch(rawCid: String) async throws -> Data {
+        guard let data = await fetchData(cid: rawCid) else {
+            throw BrokerError.notFound
+        }
+        return data
+    }
+
     /// Convenience fallback for brokers without a native batch transaction.
     /// A thrown error may leave a successfully applied prefix pinned.
     func pinBatch(roots: [String], owner: String) async throws {
@@ -58,10 +74,6 @@ public extension VolumeBroker {
                 count: item.count
             )
         }
-    }
-
-    func storeVolumeLocal(_ volume: SerializedVolume) async throws {
-        try await storeVolumesLocal([volume])
     }
 
     func pin(root: String, owner: String) async throws {

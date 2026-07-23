@@ -32,12 +32,10 @@ Reads now try memory and then disk. Stores remain explicit.
 Let Cashew produce valid Volume boundaries:
 
 ```swift
-let storer = BrokerStorer(broker: disk)
-
 // Store the root and one selected nested Volume.
 try await root.store(
     paths: [["accounts", "alice"]: .targeted],
-    storer: storer
+    storer: disk
 )
 ```
 
@@ -49,12 +47,11 @@ storer callback; callers that already hold an all-or-none batch can use
 Resolve through the read cascade:
 
 ```swift
-let source = BrokerFetcher(broker: memory)
-let resolved = try await unresolvedRoot.resolveRecursive(source: source)
+let resolved = try await unresolvedRoot.resolveRecursive(source: memory)
 ```
 
-`BrokerFetcher.fetch(_:)` resolves each Cashew frontier with one batched read
-per storage tier.
+`VolumeBroker.fetch(_:)` resolves each Cashew frontier with one batched read per
+storage tier.
 
 ## Retention
 
@@ -93,7 +90,8 @@ owner is removed.
 - `MemoryBroker` supports count or byte limits and LRU eviction.
 - `DiskBroker` uses SQLite, WAL, foreign keys, deliberate `synchronous=FULL`
   durability, and schema v1 validation.
-- `BrokerStorer` and `BrokerFetcher` connect Cashew storage and resolution.
+- Every broker is directly usable as Cashew's `VolumeStorer`, `ContentSource`,
+  and `Fetcher`.
 
 `DiskBroker` initializes only an empty v0 database. A nonempty v0 store requires
 a new database path or explicit export/rematerialization. Malformed v1 and
