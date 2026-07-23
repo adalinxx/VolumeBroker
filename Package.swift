@@ -9,7 +9,6 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/adalinxx/cashew.git", exact: "4.0.1"),
-        .package(url: "https://github.com/adalinxx/ArrayTrie.git", from: "1.0.0"),
         .package(url: "https://github.com/swift-libp2p/swift-cid.git", exact: "0.2.1"),
         .package(url: "https://github.com/swift-libp2p/swift-multihash.git", exact: "0.2.1"),
     ],
@@ -24,7 +23,6 @@ let package = Package(
             dependencies: [
                 "VolumeBrokerSQLite",
                 .product(name: "cashew", package: "cashew"),
-                .product(name: "ArrayTrie", package: "ArrayTrie"),
                 .product(name: "CID", package: "swift-cid"),
                 .product(name: "Multihash", package: "swift-multihash"),
             ]

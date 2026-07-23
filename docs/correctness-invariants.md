@@ -23,6 +23,7 @@ Retention never substitutes for publication.
 | VOLUME-016 | Presence and pin reachability use the structural serve gate; a point read validates only its requested `(CID, bytes)`, while a whole-Volume read validates the whole Volume. |
 | VOLUME-017 | A proved read mismatch durably quarantines every manifest owning the mismatched CID without deleting bytes or intent; explicit eviction performs and counts reclamation. |
 | VOLUME-018 | SQLite WAL with `synchronous=FULL` is a deliberate durable-commit boundary. |
+| VOLUME-019 | A batched CID read applies the same complete-owner serve gate, CID validation, quarantine, and local-to-far precedence as scalar reads. |
 
 Corruption is quarantined only after it is proved; a database error is not proof
 of corruption. Quarantine preserves pins and retained intent. Explicit eviction
@@ -31,4 +32,4 @@ so valid republication reactivates retained policy.
 
 Primary coverage: `VolumeIntegrityTests`, `MemoryBrokerTests`,
 `DiskBrokerTests`, `PinIndexTests`, `EvictionEngineTests`,
-`SchemaVersionTests`, `BrokerStorerTests`, and `ContentStoreTests`.
+`SchemaVersionTests`, `BrokerStorerTests`, and `BrokerFetcherTests`.

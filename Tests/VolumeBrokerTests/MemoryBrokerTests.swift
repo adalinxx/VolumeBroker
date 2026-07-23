@@ -410,4 +410,25 @@ struct MemoryBrokerTests {
         let fetched = await local.fetchVolume(root: p.root)
         #expect(fetched?.entries[cid(for: Data([42]))] == Data([42]))
     }
+
+    @Test func batchReadPreservesLocalNearFarPrecedence() async throws {
+        let far = MemoryBroker()
+        let near = MemoryBroker()
+        let local = MemoryBroker(near: near, far: far)
+        let localVolume = payload("local")
+        let nearVolume = payload("near")
+        let farVolume = payload("far")
+        try await local.storeVolumeLocal(localVolume)
+        try await near.storeVolumeLocal(nearVolume)
+        try await far.storeVolumeLocal(farVolume)
+
+        let found = await local.fetchData(cids: [
+            localVolume.root, nearVolume.root, farVolume.root, "missing",
+        ])
+
+        #expect(found[localVolume.root] == localVolume.entries[localVolume.root])
+        #expect(found[nearVolume.root] == nearVolume.entries[nearVolume.root])
+        #expect(found[farVolume.root] == farVolume.entries[farVolume.root])
+        #expect(found["missing"] == nil)
+    }
 }

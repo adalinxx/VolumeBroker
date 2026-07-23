@@ -5,9 +5,9 @@ import cashew
 /// `ContentSource` and per-CID `Fetcher`.
 ///
 /// `CoalescingFetcher` batches each resolution wave, so this adapter
-/// answers content lookups against the broker chain via `fetchData(cid:)`
+/// answers content lookups against the broker chain via `fetchData(cids:)`
 /// when a complete published Volume owns the requested CID.
-public actor BrokerFetcher: ContentSource, Fetcher {
+public struct BrokerFetcher: ContentSource, Fetcher {
     private let broker: any VolumeBroker
 
     public init(broker: any VolumeBroker) {
@@ -16,14 +16,7 @@ public actor BrokerFetcher: ContentSource, Fetcher {
 
     /// Batched: resolve each CID against the broker chain in one call.
     public func fetch(_ cids: Set<String>) async -> [String: Data] {
-        var out: [String: Data] = [:]
-        out.reserveCapacity(cids.count)
-        for cid in cids where !cid.isEmpty {
-            if let data = await broker.fetchData(cid: cid) {
-                out[cid] = data
-            }
-        }
-        return out
+        await broker.fetchData(cids: Set(cids.filter { !$0.isEmpty }))
     }
 
     /// Per-CID `Fetcher` adapter.

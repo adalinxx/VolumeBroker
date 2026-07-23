@@ -7,6 +7,7 @@ import VolumeBrokerSQLite
 
 /// Content-addressed storage for complete published Volumes.
 struct CASVolumeStore {
+    private static let maximumReadParameters = 500
     let connection: SQLiteConnection
 
     /// Every durable read uses this predicate. A manifest is complete only when
@@ -133,17 +134,80 @@ struct CASVolumeStore {
 
     /// A CAS row is readable only through at least one complete owning Volume.
     func fetchDataLocal(cid: String) async -> Data? {
-        let data: Data? = await connection.read {
-            try? Self.loadServableData(cid: cid, db: connection.readDb)
+        await fetchDataLocal(cids: [cid])[cid]
+    }
+
+    /// A batched point read preserves the same serve gate and CID validation as
+    /// scalar reads while using bounded SQLite parameter sets.
+    func fetchDataLocal(cids: Set<String>) async -> [String: Data] {
+        guard !cids.isEmpty else { return [:] }
+        let loaded: [String: Data]? = await connection.read {
+            try? Self.loadServableData(cids: cids, db: connection.readDb)
         }
-        guard let data else { return nil }
-        do {
-            try SerializedVolume.validate(cid: cid, data: data)
-            return data
-        } catch {
-            await quarantineInvalidCIDs([cid])
-            return nil
+        guard let loaded else { return [:] }
+        let invalid = Set(loaded.compactMap { cid, data in
+            (try? SerializedVolume.validate(cid: cid, data: data)) == nil ? cid : nil
+        })
+        guard !invalid.isEmpty else { return loaded }
+
+        await quarantineInvalidCIDs(invalid)
+        // Quarantining one corrupt member invalidates every manifest that owns
+        // it. Re-read valid candidates so this batch cannot return another
+        // member whose only complete owner was just quarantined.
+        return await fetchDataLocal(cids: cids.subtracting(invalid))
+    }
+
+    private static func loadServableData(
+        cids: Set<String>,
+        db: OpaquePointer
+    ) throws -> [String: Data] {
+        var found: [String: Data] = [:]
+        found.reserveCapacity(cids.count)
+        let ordered = Array(cids)
+        for start in stride(from: 0, to: ordered.count, by: maximumReadParameters) {
+            let chunk = ordered[start..<min(start + maximumReadParameters, ordered.count)]
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            let placeholders = (1...chunk.count).map { "?\($0)" }.joined(separator: ",")
+            let sql = """
+                SELECT cd.cid, cd.data
+                FROM cas_data cd
+                WHERE cd.cid IN (\(placeholders))
+                  AND EXISTS (
+                      SELECT 1
+                      FROM volume_entries owner
+                      JOIN volume_metadata vm ON vm.root = owner.root
+                      WHERE owner.cid = cd.cid
+                        AND \(Self.completeVolumePredicate)
+                  )
+                """
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK,
+                  let stmt else {
+                throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            for (offset, cid) in chunk.enumerated() {
+                sqlite3_bind_text(stmt, Int32(offset + 1), cid, -1, SQLITE_TRANSIENT_SHIM)
+            }
+            while true {
+                let result = sqlite3_step(stmt)
+                if result == SQLITE_DONE { break }
+                guard result == SQLITE_ROW,
+                      let cid = sqlite3_column_text(stmt, 0),
+                      sqlite3_column_type(stmt, 1) != SQLITE_NULL else {
+                    throw BrokerError.sqlFailed(String(cString: sqlite3_errmsg(db)))
+                }
+                let key = String(cString: cid)
+                let length = Int(sqlite3_column_bytes(stmt, 1))
+                if length == 0 {
+                    found[key] = Data()
+                } else if let bytes = sqlite3_column_blob(stmt, 1) {
+                    found[key] = Data(bytes: bytes, count: length)
+                } else {
+                    throw BrokerError.sqlFailed("read CAS content")
+                }
+            }
         }
+        return found
     }
 
     private static func loadServableData(cid: String, db: OpaquePointer) throws -> Data? {

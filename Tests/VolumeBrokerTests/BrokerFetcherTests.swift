@@ -15,6 +15,35 @@ struct BrokerFetcherTests {
         return try! CID(version: .v1, codec: .dag_cbor, multihash: multihash).toBaseEncodedString
     }
 
+    private final class RecordingBroker: VolumeBroker, @unchecked Sendable {
+        let near: (any VolumeBroker)? = nil
+        let far: (any VolumeBroker)? = nil
+        private let lock = NSLock()
+        private var scalarReads = 0
+        private var batchReads = 0
+
+        func hasVolume(root: String) async -> Bool { false }
+        func fetchVolumeLocal(root: String) async -> SerializedVolume? { nil }
+        func fetchDataLocal(cid: String) async -> Data? {
+            lock.withLock { scalarReads += 1 }
+            return nil
+        }
+        func fetchDataLocal(cids: Set<String>) async -> [String: Data] {
+            lock.withLock { batchReads += 1 }
+            return Dictionary(uniqueKeysWithValues: cids.map { ($0, Data($0.utf8)) })
+        }
+        func storeVolumesLocal(_ volumes: [SerializedVolume]) async throws {}
+        func pin(root: String, owner: String, count: Int, ttl: Duration?) async throws {}
+        func unpin(root: String, owner: String, count: Int) async throws {}
+        func unpinAll(owner: String) async throws {}
+        func owners(root: String) async -> Set<String> { [] }
+        func evictUnpinned() async throws -> Int { 0 }
+
+        var counts: (scalar: Int, batch: Int) {
+            lock.withLock { (scalarReads, batchReads) }
+        }
+    }
+
     @Test func resolvesMultiNodeVolumeThroughBatchedSource() async throws {
         let broker = MemoryBroker()
         let storer = BrokerStorer(broker: broker)
@@ -48,6 +77,19 @@ struct BrokerFetcherTests {
         #expect(got[a.rawCID] != nil)
         #expect(got[b.rawCID] != nil)
         #expect(got["missing"] == nil)
+    }
+
+    @Test func batchedFetchUsesOneBrokerBatch() async {
+        let broker = RecordingBroker()
+        let got = await BrokerFetcher(broker: broker).fetch(["a", "b", "c"])
+
+        #expect(got == [
+            "a": Data("a".utf8),
+            "b": Data("b".utf8),
+            "c": Data("c".utf8),
+        ])
+        #expect(broker.counts.scalar == 0)
+        #expect(broker.counts.batch == 1)
     }
 
     @Test func fetchesInternalEntryByCidWithoutEnteringVolume() async throws {

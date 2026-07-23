@@ -772,6 +772,16 @@ final class VolumeIntegrityTests: XCTestCase {
         }
     }
 
+    func testBatchReadDoesNotReturnMembersWhoseOwnerWasQuarantined() async throws {
+        try await withCorruptedStore(.corruptBytes) { _, store, root, child in
+            let found = await store.fetchDataLocal(cids: [root, child])
+            let present = await store.hasVolume(root: root)
+
+            XCTAssertTrue(found.isEmpty)
+            XCTAssertFalse(present)
+        }
+    }
+
     func testWholeVolumeProofQuarantinesEveryOwnerOfCorruptContent() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("VolumeIntegrityTests-\(UUID().uuidString)")

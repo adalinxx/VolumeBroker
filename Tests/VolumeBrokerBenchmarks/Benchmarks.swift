@@ -125,6 +125,22 @@ struct Benchmarks {
         }
     }
 
+    @Test func diskSparseFrontierBatchRead() async throws {
+        let broker = try tempDB()
+        let volumes = (0..<64).map { payload("sparse-\($0)", entryCount: 16) }
+        try await broker.storeVolumesLocal(volumes)
+        let requested = Set(volumes.flatMap { $0.entries.keys.prefix(2) })
+        print("\n--- DiskBroker: sparse Cashew frontier across 64 Volumes ---")
+
+        let found = await broker.fetchDataLocal(cids: requested)
+        #expect(found.count == requested.count)
+        try await measure("batch \(requested.count) sparse CIDs", iterations: 20) {
+            guard await broker.fetchDataLocal(cids: requested).count == requested.count else {
+                throw BenchmarkError.missingVolume("sparse frontier")
+            }
+        }
+    }
+
     @Test func diskHasVolume() async throws {
         let broker = try tempDB()
         for i in 0..<100 {

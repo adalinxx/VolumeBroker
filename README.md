@@ -53,7 +53,8 @@ let source = BrokerFetcher(broker: memory)
 let resolved = try await unresolvedRoot.resolveRecursive(source: source)
 ```
 
-`ContentStore` provides the same integration at the object-by-root-CID level.
+`BrokerFetcher.fetch(_:)` resolves each Cashew frontier with one batched read
+per storage tier.
 
 ## Retention
 
@@ -93,7 +94,6 @@ owner is removed.
 - `DiskBroker` uses SQLite, WAL, foreign keys, deliberate `synchronous=FULL`
   durability, and schema v1 validation.
 - `BrokerStorer` and `BrokerFetcher` connect Cashew storage and resolution.
-- `ContentStore` stores and resolves Cashew `Node` values by root CID.
 
 `DiskBroker` initializes only an empty v0 database. A nonempty v0 store requires
 a new database path or explicit export/rematerialization. Malformed v1 and

@@ -85,6 +85,24 @@ struct DiskBrokerTests {
         return (directory, directory.appendingPathComponent("volumes.sqlite").path)
     }
 
+    @Test func batchPointReadSpansBoundedSQLiteChunks() async throws {
+        let broker = try tempDB()
+        let rootData = Data("batch-root".utf8)
+        let root = cid(for: rootData)
+        var entries = [root: rootData]
+        for index in 0..<1_200 {
+            let data = Data("sparse-entry-\(index)".utf8)
+            entries[cid(for: data)] = data
+        }
+        try await broker.storeVolumeLocal(SerializedVolume(root: root, entries: entries))
+
+        var requested = Set(entries.keys)
+        requested.insert("missing")
+        let found = await broker.fetchDataLocal(cids: requested)
+
+        #expect(found == entries)
+    }
+
     private func databaseHealth(at path: String) throws -> (integrity: String, foreignKeyViolations: Int) {
         var database: OpaquePointer?
         guard sqlite3_open_v2(path, &database, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,

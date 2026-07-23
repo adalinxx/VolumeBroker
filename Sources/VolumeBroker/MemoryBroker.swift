@@ -74,12 +74,21 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootMergeBroker {
     }
 
     public func fetchDataLocal(cid: String) async -> Data? {
+        await fetchDataLocal(cids: [cid])[cid]
+    }
+
+    public func fetchDataLocal(cids: Set<String>) async -> [String: Data] {
         lock.withWriteLock {
-            guard let data = state.contentByCID[cid],
-                  let owners = state.ownersByCID[cid],
-                  !owners.isEmpty else { return nil }
-            for root in owners { state.lru.touch(root) }
-            return data
+            var found: [String: Data] = [:]
+            found.reserveCapacity(cids.count)
+            for cid in cids {
+                guard let data = state.contentByCID[cid],
+                      let owners = state.ownersByCID[cid],
+                      !owners.isEmpty else { continue }
+                for root in owners { state.lru.touch(root) }
+                found[cid] = data
+            }
+            return found
         }
     }
 
