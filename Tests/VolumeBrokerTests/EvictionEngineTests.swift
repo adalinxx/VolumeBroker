@@ -58,7 +58,7 @@ struct EvictionEngineTests {
     /// An unpinned root and its data are reclaimed; the return value counts it.
     @Test func unpinnedRootIsReclaimed() async throws {
         let h = try harness()
-        try await h.store.storeVolumeLocal(volume("drop"))
+        try await h.store.store(volume: volume("drop"))
 
         let evicted = try await h.eviction.evictUnpinned(graceSeconds: 0)
         #expect(evicted == 1)
@@ -69,8 +69,8 @@ struct EvictionEngineTests {
     /// A pinned root survives; an unpinned sibling is reclaimed in the same pass.
     @Test func pinnedRootSurvivesWhileSiblingIsReclaimed() async throws {
         let h = try harness()
-        try await h.store.storeVolumeLocal(volume("keep"))
-        try await h.store.storeVolumeLocal(volume("drop"))
+        try await h.store.store(volume: volume("keep"))
+        try await h.store.store(volume: volume("drop"))
         try await h.pins.pin(root: cid("keep"), owner: "owner", count: 1, ttl: nil)
 
         let evicted = try await h.eviction.evictUnpinned(graceSeconds: 0)
@@ -84,8 +84,8 @@ struct EvictionEngineTests {
     @Test func sharedBlobSurvivesPartialEviction() async throws {
         let h = try harness()
         let shared = Data([0xAB, 0xCD])
-        try await h.store.storeVolumeLocal(volume("keep", ["shared": shared, "onlyKeep": Data([1])]))
-        try await h.store.storeVolumeLocal(volume("drop", ["shared": shared, "onlyDrop": Data([2])]))
+        try await h.store.store(volume: volume("keep", ["shared": shared, "onlyKeep": Data([1])]))
+        try await h.store.store(volume: volume("drop", ["shared": shared, "onlyDrop": Data([2])]))
         try await h.pins.pin(root: cid("keep"), owner: "owner", count: 1, ttl: nil)
 
         _ = try await h.eviction.evictUnpinned(graceSeconds: 0)
@@ -98,7 +98,7 @@ struct EvictionEngineTests {
     @Test func livePinBlocksEviction() async throws {
         let h = try harness()
         let root = cid("r1")
-        try await h.store.storeVolumeLocal(volume("r1"))
+        try await h.store.store(volume: volume("r1"))
         try await h.pins.pin(root: root, owner: "owner-a", count: 1, ttl: nil)
         try await h.pins.pin(root: root, owner: "owner-b", count: 1, ttl: nil)
 
@@ -112,7 +112,7 @@ struct EvictionEngineTests {
     @Test func ttlExpiredPinIsPrunedThenReclaimed() async throws {
         let h = try harness()
         let root = cid("r1")
-        try await h.store.storeVolumeLocal(volume("r1"))
+        try await h.store.store(volume: volume("r1"))
         try await h.pins.pin(root: root, owner: "owner-a", count: 1, ttl: .zero)
 
         let evicted = try await h.eviction.evictUnpinned(graceSeconds: 0)
@@ -126,7 +126,7 @@ struct EvictionEngineTests {
     @Test func expiredPinNeitherServesNorProtects() async throws {
         let h = try harness()
         let root = cid("r1")
-        try await h.store.storeVolumeLocal(volume("r1"))
+        try await h.store.store(volume: volume("r1"))
         try await h.pins.pin(root: root, owner: "owner-a", count: 1, ttl: .zero)
 
         #expect(await h.pins.isPinReachable(cid: root) == false,
@@ -141,7 +141,7 @@ struct EvictionEngineTests {
     @Test func livePinServesAndProtects() async throws {
         let h = try harness()
         let root = cid("r1")
-        try await h.store.storeVolumeLocal(volume("r1"))
+        try await h.store.store(volume: volume("r1"))
         try await h.pins.pin(root: root, owner: "owner-a", count: 1, ttl: nil)
 
         #expect(await h.pins.isPinReachable(cid: root))
@@ -154,7 +154,7 @@ struct EvictionEngineTests {
     @Test func danglingMembershipAndPinOwnNothing() async throws {
         let h = try harness()
         let root = cid("dangling")
-        try await h.store.storeVolumeLocal(volume("dangling"))
+        try await h.store.store(volume: volume("dangling"))
         try await h.pins.pin(root: root, owner: "owner", count: 1, ttl: nil)
         try await h.connection.write {
             try h.connection.exec("PRAGMA foreign_keys=OFF")
@@ -176,7 +176,7 @@ struct EvictionEngineTests {
     @Test func realEntryCountOwnsNothing() async throws {
         let h = try harness()
         let root = cid("real-count")
-        try await h.store.storeVolumeLocal(volume("real-count"))
+        try await h.store.store(volume: volume("real-count"))
         try await h.pins.pin(root: root, owner: "owner", count: 1, ttl: nil)
         try await h.connection.write {
             try h.connection.exec("""
@@ -196,7 +196,7 @@ struct EvictionEngineTests {
         let h = try harness()
         let retained = RetainedRootIndex(connection: h.connection)
         let root = cid("lost")
-        try await h.store.storeVolumeLocal(volume("lost"))
+        try await h.store.store(volume: volume("lost"))
         try await retained.advanceRetainedRoots(scope: "canonical", roots: [root])
         try await h.connection.write {
             try h.connection.exec("DELETE FROM volume_metadata WHERE root='\(root)'")
@@ -210,7 +210,7 @@ struct EvictionEngineTests {
         let h = try harness()
         let retained = RetainedRootIndex(connection: h.connection)
         let root = cid("corrupt")
-        try await h.store.storeVolumeLocal(volume("corrupt"))
+        try await h.store.store(volume: volume("corrupt"))
         try await retained.advanceRetainedRoots(scope: "canonical", roots: [root])
         try await h.pins.pin(root: root, owner: "owner", count: 1, ttl: nil)
         try await h.connection.write {
@@ -237,7 +237,7 @@ struct EvictionEngineTests {
         #expect(await h.pins.owners(root: root).isEmpty)
         #expect(try await retained.retainedRoots(scope: "canonical") == [root])
 
-        try await h.store.storeVolumeLocal(volume("corrupt"))
+        try await h.store.store(volume: volume("corrupt"))
         #expect(try await retained.retainedRoots(scope: "canonical") == [root])
         #expect(try await h.eviction.evictUnpinned(graceSeconds: 0) == 0)
         #expect(await h.store.hasVolume(root: root))
@@ -270,7 +270,7 @@ struct EvictionEngineTests {
     @Test func quarantineSQLFailureNeverDeletesContent() async throws {
         let h = try harness()
         let root = cid("sql-failure")
-        try await h.store.storeVolumeLocal(volume("sql-failure"))
+        try await h.store.store(volume: volume("sql-failure"))
         try await h.connection.write {
             try h.connection.exec("UPDATE cas_data SET data=X'00' WHERE cid='\(root)'")
         }
@@ -287,7 +287,7 @@ struct EvictionEngineTests {
     @Test func nonpositivePinCountIsRejected() async throws {
         let h = try harness()
         let root = cid("r1")
-        try await h.store.storeVolumeLocal(volume("r1"))
+        try await h.store.store(volume: volume("r1"))
         await #expect(throws: BrokerError.invalidPinCount) {
             try await h.pins.pin(root: root, owner: "owner-a", count: 0, ttl: nil)
         }
@@ -302,7 +302,7 @@ struct EvictionEngineTests {
     @Test func evictRespectsStoreThenPinGrace() async throws {
         let h = try harness()
         let root = cid("V")
-        try await h.store.storeVolumeLocal(volume("V"))
+        try await h.store.store(volume: volume("V"))
 
         let graceEvicted = try await h.eviction.evictUnpinned(graceSeconds: 60 * 60)
         #expect(graceEvicted == 0)
@@ -324,8 +324,8 @@ struct EvictionEngineTests {
         let shared = Data("shared".utf8)
         let oldRoot = cid("old")
         let freshRoot = cid("fresh")
-        try await h.store.storeVolumeLocal(volume("old", ["shared": shared]))
-        try await h.store.storeVolumeLocal(volume("fresh", ["shared": shared]))
+        try await h.store.store(volume: volume("old", ["shared": shared]))
+        try await h.store.store(volume: volume("fresh", ["shared": shared]))
         try await h.connection.write {
             try h.connection.exec("""
                 UPDATE volume_metadata
@@ -346,8 +346,8 @@ struct EvictionEngineTests {
         let shared = Data("shared".utf8)
         let sharedCID = cid(for: shared)
         let keepRoot = cid("keep")
-        try await h.store.storeVolumeLocal(volume("keep", ["shared": shared]))
-        try await h.store.storeVolumeLocal(volume("drop", ["shared": shared]))
+        try await h.store.store(volume: volume("keep", ["shared": shared]))
+        try await h.store.store(volume: volume("drop", ["shared": shared]))
         try await h.pins.pin(root: keepRoot, owner: "owner", count: 1, ttl: nil)
 
         _ = try await h.eviction.evictUnpinned(graceSeconds: 0)

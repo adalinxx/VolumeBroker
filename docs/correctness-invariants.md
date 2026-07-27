@@ -17,12 +17,13 @@ Retention never substitutes for publication.
 | VOLUME-010 | Retained-set replacement and merge are naturally idempotent. Pin-count mutations are not replay-deduplicated; the caller owns durable transition replay. |
 | VOLUME-011 | A bounded memory store rejects a batch before mutation if protected and submitted Volumes cannot fit. |
 | VOLUME-012 | Shared CAS bytes remain until their last owning Volume is removed; eviction never decrements pins. |
-| VOLUME-013 | `near` and `far` are read tiers in one domain; writes and cross-domain synchronization are explicit. |
+| VOLUME-013 | Immutable `near` and `far` links are read tiers in one domain; writes and cross-domain synchronization are explicit. |
 | VOLUME-014 | Empty v0 initializes atomically; malformed, nonempty, and unsupported schemas are not mutated. |
 | VOLUME-015 | Chain state, canonicity, and application metadata cannot bypass the Volume contract. |
 | VOLUME-016 | Presence and pin reachability use the structural serve gate; a point read validates only its requested `(CID, bytes)`, while a whole-Volume read validates the whole Volume. |
 | VOLUME-017 | A proved read mismatch durably quarantines every manifest owning the mismatched CID without deleting bytes or intent; explicit eviction performs and counts reclamation. |
 | VOLUME-018 | SQLite WAL with `synchronous=FULL` is a deliberate durable-commit boundary. |
+| VOLUME-019 | A batched CID read applies the same complete-owner serve gate, CID validation, quarantine, and local-to-far precedence as scalar reads. |
 
 Corruption is quarantined only after it is proved; a database error is not proof
 of corruption. Quarantine preserves pins and retained intent. Explicit eviction
@@ -31,4 +32,4 @@ so valid republication reactivates retained policy.
 
 Primary coverage: `VolumeIntegrityTests`, `MemoryBrokerTests`,
 `DiskBrokerTests`, `PinIndexTests`, `EvictionEngineTests`,
-`SchemaVersionTests`, `BrokerStorerTests`, and `ContentStoreTests`.
+`SchemaVersionTests`, and `CashewProtocolTests`.

@@ -4,12 +4,6 @@ import CID
 import Multihash
 @testable import VolumeBroker
 
-private extension VolumeBroker {
-    func link(near: (any VolumeBroker)? = nil) {
-        self.near = near
-    }
-}
-
 @Suite("Benchmarks")
 struct Benchmarks {
 
@@ -66,7 +60,7 @@ struct Benchmarks {
         print("\n--- DiskBroker: Store small volumes (10 entries each) ---")
         try await measure("store 1000 volumes", iterations: 1000) {
             let p = payload("r-\(Int.random(in: 0..<1_000_000))", entryCount: 10)
-            try await broker.storeVolumeLocal(p)
+            try await broker.store(volume: p)
         }
     }
 
@@ -75,7 +69,7 @@ struct Benchmarks {
         print("\n--- DiskBroker: Store large volume (1000 entries, 256B each) ---")
         try await measure("store 1 large volume", iterations: 10) {
             let p = payload("large-\(Int.random(in: 0..<1_000_000))", entryCount: 1000, dataSize: 256)
-            try await broker.storeVolumeLocal(p)
+            try await broker.store(volume: p)
         }
     }
 
@@ -100,7 +94,7 @@ struct Benchmarks {
         }
         try await measure("individual stores", iterations: 1) {
             for p in individualPayloads {
-                try await brokerIndividual.storeVolumeLocal(p)
+                try await brokerIndividual.store(volume: p)
             }
         }
 
@@ -118,7 +112,7 @@ struct Benchmarks {
     @Test func diskFetch() async throws {
         let broker = try tempDB()
         for i in 0..<100 {
-            try await broker.storeVolumeLocal(payload("r-\(i)", entryCount: 20))
+            try await broker.store(volume: payload("r-\(i)", entryCount: 20))
         }
         print("\n--- DiskBroker: Fetch volumes (20 entries each) ---")
         var index = 0
@@ -131,10 +125,26 @@ struct Benchmarks {
         }
     }
 
+    @Test func diskSparseFrontierBatchRead() async throws {
+        let broker = try tempDB()
+        let volumes = (0..<64).map { payload("sparse-\($0)", entryCount: 16) }
+        try await broker.storeVolumesLocal(volumes)
+        let requested = Set(volumes.flatMap { $0.entries.keys.prefix(2) })
+        print("\n--- DiskBroker: sparse Cashew frontier across 64 Volumes ---")
+
+        let found = await broker.fetchDataLocal(cids: requested)
+        #expect(found.count == requested.count)
+        try await measure("batch \(requested.count) sparse CIDs", iterations: 20) {
+            guard await broker.fetchDataLocal(cids: requested).count == requested.count else {
+                throw BenchmarkError.missingVolume("sparse frontier")
+            }
+        }
+    }
+
     @Test func diskHasVolume() async throws {
         let broker = try tempDB()
         for i in 0..<100 {
-            try await broker.storeVolumeLocal(payload("r-\(i)", entryCount: 5))
+            try await broker.store(volume: payload("r-\(i)", entryCount: 5))
         }
         print("\n--- DiskBroker: hasVolume checks ---")
         var index = 0
@@ -158,7 +168,7 @@ struct Benchmarks {
         let target = try #require(members.first)
         let corruptSibling = try #require(members.last)
         let expected = try #require(volume.entries[target])
-        try await store.storeVolumeLocal(volume)
+        try await store.store(volume: volume)
         try await connection.write {
             try connection.exec("UPDATE cas_data SET data=X'00' WHERE cid='\(corruptSibling)'")
         }
@@ -185,7 +195,7 @@ struct Benchmarks {
     @Test func diskPinUnpin() async throws {
         let broker = try tempDB()
         for i in 0..<100 {
-            try await broker.storeVolumeLocal(payload("r-\(i)", entryCount: 5))
+            try await broker.store(volume: payload("r-\(i)", entryCount: 5))
         }
         print("\n--- DiskBroker: Pin/unpin operations ---")
         try await measure("pin 1000 times", iterations: 1000) {
@@ -202,7 +212,7 @@ struct Benchmarks {
         print("\n--- DiskBroker: Eviction (500 volumes, 50 pinned) ---")
         let broker = try tempDB()
         for i in 0..<500 {
-            try await broker.storeVolumeLocal(payload("r-\(i)", entryCount: 10))
+            try await broker.store(volume: payload("r-\(i)", entryCount: 10))
         }
         for i in 0..<50 {
             try await broker.pin(root: cid("r-\(i)"), owner: "keeper")
@@ -225,7 +235,7 @@ struct Benchmarks {
         try await measure("store 5000 volumes", iterations: 5000) {
             let p = payload("r-\(storeIndex)", entryCount: 5)
             storeIndex += 1
-            try await broker.storeVolumeLocal(p)
+            try await broker.store(volume: p)
         }
         var fetchIndex = 0
         var hits = 0
@@ -240,7 +250,7 @@ struct Benchmarks {
         // grace .zero — exercise eviction mechanics, not the store-then-pin grace
         let broker = MemoryBroker(evictUnpinnedGrace: .zero)
         for i in 0..<1000 {
-            try await broker.storeVolumeLocal(payload("r-\(i)", entryCount: 5))
+            try await broker.store(volume: payload("r-\(i)", entryCount: 5))
         }
         for i in 0..<100 {
             try await broker.pin(root: cid("r-\(i)"), owner: "keeper")
@@ -268,7 +278,7 @@ struct Benchmarks {
     @Test func diskConcurrentReads() async throws {
         let broker = try tempDB()
         for i in 0..<200 {
-            try await broker.storeVolumeLocal(payload("r-\(i)", entryCount: 20))
+            try await broker.store(volume: payload("r-\(i)", entryCount: 20))
         }
         print("\n--- DiskBroker: Concurrent reads (4 tasks × 500 fetches) ---")
 
@@ -299,7 +309,7 @@ struct Benchmarks {
     @Test func diskConcurrentReadsWhileWriting() async throws {
         let broker = try tempDB()
         for i in 0..<200 {
-            try await broker.storeVolumeLocal(payload("r-\(i)", entryCount: 20))
+            try await broker.store(volume: payload("r-\(i)", entryCount: 20))
         }
         print("\n--- DiskBroker: Concurrent reads + writes (3 readers + 1 writer) ---")
 
@@ -318,7 +328,7 @@ struct Benchmarks {
             }
             group.addTask {
                 for i in 200..<400 {
-                    try await broker.storeVolumeLocal(payload("w-\(i)", entryCount: 2))
+                    try await broker.store(volume: payload("w-\(i)", entryCount: 2))
                 }
                 return 0
             }
@@ -340,15 +350,14 @@ struct Benchmarks {
     // MARK: - Cascade Fetch
 
     @Test func cascadeFetchPerformance() async throws {
-        let memory = MemoryBroker(capacity: 50)
         let disk = try tempDB()
-        memory.link(near: disk)
+        let memory = MemoryBroker(capacity: 50, near: disk)
 
         for i in 0..<200 {
-            try await disk.storeVolumeLocal(payload("r-\(i)", entryCount: 10))
+            try await disk.store(volume: payload("r-\(i)", entryCount: 10))
         }
         for i in 0..<50 {
-            try await memory.storeVolumeLocal(payload("r-\(i)", entryCount: 10))
+            try await memory.store(volume: payload("r-\(i)", entryCount: 10))
         }
 
         print("\n--- Cascade: memory(50) → disk(200) fetch ---")

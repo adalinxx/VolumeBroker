@@ -76,7 +76,7 @@ struct SchemaVersionTests {
         let root = try cid(for: data)
 
         let broker = try DiskBroker(path: location.path)
-        try await broker.storeVolumeLocal(SerializedVolume(root: root, entries: [root: data]))
+        try await broker.store(volume: SerializedVolume(root: root, entries: [root: data]))
         #expect(await broker.hasVolume(root: root))
 
         try withDatabase(at: location.path) { db in

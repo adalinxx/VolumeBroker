@@ -85,6 +85,24 @@ struct DiskBrokerTests {
         return (directory, directory.appendingPathComponent("volumes.sqlite").path)
     }
 
+    @Test func batchPointReadSpansBoundedSQLiteChunks() async throws {
+        let broker = try tempDB()
+        let rootData = Data("batch-root".utf8)
+        let root = cid(for: rootData)
+        var entries = [root: rootData]
+        for index in 0..<1_200 {
+            let data = Data("sparse-entry-\(index)".utf8)
+            entries[cid(for: data)] = data
+        }
+        try await broker.store(volume: SerializedVolume(root: root, entries: entries))
+
+        var requested = Set(entries.keys)
+        requested.insert("missing")
+        let found = await broker.fetchDataLocal(cids: requested)
+
+        #expect(found == entries)
+    }
+
     private func databaseHealth(at path: String) throws -> (integrity: String, foreignKeyViolations: Int) {
         var database: OpaquePointer?
         guard sqlite3_open_v2(path, &database, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
@@ -170,7 +188,7 @@ struct DiskBrokerTests {
     @Test func storeAndFetch() async throws {
         let broker = try tempDB()
         let p = payload("r1", ["c1": Data([1, 2, 3]), "c2": Data([4, 5])])
-        try await broker.storeVolumeLocal(p)
+        try await broker.store(volume: p)
 
         #expect(await broker.hasVolume(root: p.root))
         let fetched = await broker.fetchVolumeLocal(root: p.root)
@@ -185,7 +203,7 @@ struct DiskBrokerTests {
         let broker = try tempDB()
         let entries = ["a": Data([0, 1, 2, 3]), "b": Data(repeating: 7, count: 256)]
         let stored = payload("round", entries)
-        try await broker.storeVolumeLocal(stored)
+        try await broker.store(volume: stored)
 
         let fetched = await broker.fetchVolumeLocal(root: stored.root)
         #expect(fetched?.entries == stored.entries)
@@ -197,8 +215,8 @@ struct DiskBrokerTests {
         let broker = try tempDB()
         let keep = cid("keep")
         let drop = cid("drop")
-        try await broker.storeVolumeLocal(payload("keep"))
-        try await broker.storeVolumeLocal(payload("drop"))
+        try await broker.store(volume: payload("keep"))
+        try await broker.store(volume: payload("drop"))
         try await broker.pin(root: keep, owner: "owner")
 
         let evicted = try await broker.evictUnpinned()
@@ -213,7 +231,7 @@ struct DiskBrokerTests {
     @Test func unpinnedRootIsEvicted() async throws {
         let broker = try tempDB()
         let root = cid("r1")
-        try await broker.storeVolumeLocal(payload("r1"))
+        try await broker.store(volume: payload("r1"))
         try await broker.pin(root: root, owner: "owner")
         try await broker.unpin(root: root, owner: "owner")
 
@@ -225,7 +243,7 @@ struct DiskBrokerTests {
     @Test func configuredGraceProtectsFreshUnpinnedVolume() async throws {
         let broker = try tempDB(evictUnpinnedGraceSeconds: 60 * 60)
         let root = cid("fresh")
-        try await broker.storeVolumeLocal(payload("fresh"))
+        try await broker.store(volume: payload("fresh"))
 
         let protected = try await broker.evictUnpinned()
         #expect(protected == 0)
@@ -240,8 +258,8 @@ struct DiskBrokerTests {
         let broker = try tempDB()
         let r1 = cid("r1")
         let r2 = cid("r2")
-        try await broker.storeVolumeLocal(payload("r1"))
-        try await broker.storeVolumeLocal(payload("r2"))
+        try await broker.store(volume: payload("r1"))
+        try await broker.store(volume: payload("r2"))
         try await broker.pin(root: r1, owner: "chain-a")
 
         let evicted = try await broker.evictUnpinned()
@@ -254,8 +272,8 @@ struct DiskBrokerTests {
         let broker = try tempDB()
         let shared = Data([99])
         let r1 = cid("r1")
-        try await broker.storeVolumeLocal(payload("r1", ["shared": shared, "only1": Data([1])]))
-        try await broker.storeVolumeLocal(payload("r2", ["shared": shared, "only2": Data([2])]))
+        try await broker.store(volume: payload("r1", ["shared": shared, "only1": Data([1])]))
+        try await broker.store(volume: payload("r2", ["shared": shared, "only2": Data([2])]))
         try await broker.pin(root: r1, owner: "chain-a")
 
         _ = try await broker.evictUnpinned()
@@ -267,8 +285,8 @@ struct DiskBrokerTests {
         let broker = try tempDB()
         let keep = cid("keep")
         let drop = cid("drop")
-        try await broker.storeVolumeLocal(payload("keep"))
-        try await broker.storeVolumeLocal(payload("drop"))
+        try await broker.store(volume: payload("keep"))
+        try await broker.store(volume: payload("drop"))
 
         try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [keep])
 
@@ -286,9 +304,9 @@ struct DiskBrokerTests {
         let old = cid("old")
         let new = cid("new")
         let other = cid("other")
-        try await broker.storeVolumeLocal(payload("old"))
-        try await broker.storeVolumeLocal(payload("new"))
-        try await broker.storeVolumeLocal(payload("other"))
+        try await broker.store(volume: payload("old"))
+        try await broker.store(volume: payload("new"))
+        try await broker.store(volume: payload("other"))
 
         try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [old])
         try await broker.advanceRetainedRoots(scope: "chain-b:state", roots: [other])
@@ -308,9 +326,9 @@ struct DiskBrokerTests {
         let old = cid("old")
         let new = cid("new")
         let drop = cid("drop")
-        try await broker.storeVolumeLocal(payload("old"))
-        try await broker.storeVolumeLocal(payload("new"))
-        try await broker.storeVolumeLocal(payload("drop"))
+        try await broker.store(volume: payload("old"))
+        try await broker.store(volume: payload("new"))
+        try await broker.store(volume: payload("drop"))
 
         try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [old])
         try await broker.mergeRetainedRoots(scope: "chain-a:state", roots: [new])
@@ -396,7 +414,7 @@ struct DiskBrokerTests {
     @Test func retainedRootReplaceIsNaturallyIdempotent() async throws {
         let broker = try tempDB()
         let r1 = cid("r1")
-        try await broker.storeVolumeLocal(payload("r1"))
+        try await broker.store(volume: payload("r1"))
 
         try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [r1])
         try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [r1])
@@ -420,7 +438,7 @@ struct DiskBrokerTests {
     @Test func retainedRootAdvanceValidatesOnlyRequestedVolume() async throws {
         let broker = try tempDB()
         let root = cid("root")
-        try await broker.storeVolumeLocal(payload("root", [
+        try await broker.store(volume: payload("root", [
             "root": Data("root".utf8),
             "child": Data("child".utf8),
         ]))
@@ -456,7 +474,7 @@ struct DiskBrokerTests {
     @Test func multiOwnerPins() async throws {
         let broker = try tempDB()
         let root = cid("r1")
-        try await broker.storeVolumeLocal(payload("r1"))
+        try await broker.store(volume: payload("r1"))
         try await broker.pin(root: root, owner: "chain-a")
         try await broker.pin(root: root, owner: "chain-b")
 
@@ -471,7 +489,7 @@ struct DiskBrokerTests {
     @Test func duplicatePinAddsToCount() async throws {
         let broker = try tempDB()
         let root = cid("r1")
-        try await broker.storeVolumeLocal(payload("r1"))
+        try await broker.store(volume: payload("r1"))
         try await broker.pin(root: root, owner: "chain-a")
         try await broker.pin(root: root, owner: "chain-a")
         #expect(await broker.owners(root: root).count == 1)
@@ -492,7 +510,7 @@ struct DiskBrokerTests {
     @Test func pinWithExplicitCount() async throws {
         let broker = try tempDB()
         let root = cid("r1")
-        try await broker.storeVolumeLocal(payload("r1"))
+        try await broker.store(volume: payload("r1"))
         try await broker.pin(root: root, owner: "chain-a", count: 3)
 
         try await broker.unpin(root: root, owner: "chain-a", count: 2)
@@ -505,7 +523,7 @@ struct DiskBrokerTests {
     @Test func unpinMoreThanCountRemovesPin() async throws {
         let broker = try tempDB()
         let root = cid("r1")
-        try await broker.storeVolumeLocal(payload("r1"))
+        try await broker.store(volume: payload("r1"))
         try await broker.pin(root: root, owner: "chain-a", count: 2)
         try await broker.unpin(root: root, owner: "chain-a", count: 5)
         #expect(await broker.owners(root: root).isEmpty)
@@ -514,7 +532,7 @@ struct DiskBrokerTests {
     @Test func ttlExpiredOwnerPrunedOnEvict() async throws {
         let broker = try tempDB()
         let root = cid("r1")
-        try await broker.storeVolumeLocal(payload("r1"))
+        try await broker.store(volume: payload("r1"))
         try await broker.pin(root: root, owner: "chain-a:42", ttl: .zero)
 
         let evicted = try await broker.evictUnpinned()
@@ -525,7 +543,7 @@ struct DiskBrokerTests {
     @Test func mixedTTLAndPermanentOwners() async throws {
         let broker = try tempDB()
         let root = cid("r1")
-        try await broker.storeVolumeLocal(payload("r1"))
+        try await broker.store(volume: payload("r1"))
         try await broker.pin(root: root, owner: "chain-a:42", ttl: .zero)
         try await broker.pin(root: root, owner: "chain-b:tip")
 
@@ -561,7 +579,7 @@ struct DiskBrokerTests {
             let broker = try DiskBroker(path: location.path)
             let volume = payload("pin-unpin")
             let owner = "shared-owner"
-            try await broker.storeVolumeLocal(volume)
+            try await broker.store(volume: volume)
             try await broker.pin(root: volume.root, owner: owner)
 
             let (pin, unpin) = await Self.race(
@@ -586,7 +604,7 @@ struct DiskBrokerTests {
             let owner = "shared-owner"
 
             let (store, pin) = await Self.race(
-                { await Self.capture { try await broker.storeVolumeLocal(volume); return true } },
+                { await Self.capture { try await broker.store(volume: volume); return true } },
                 { await Self.capture { try await broker.pin(root: volume.root, owner: owner); return true } }
             )
             _ = try store.get()
@@ -646,7 +664,7 @@ struct DiskBrokerTests {
             let broker = try DiskBroker(path: location.path, evictUnpinnedGraceSeconds: 0)
             let volume = payload("evict-pin")
             let owner = "shared-owner"
-            try await broker.storeVolumeLocal(volume)
+            try await broker.store(volume: volume)
 
             let (eviction, pin) = await Self.race(
                 { await Self.capture { try await broker.evictUnpinned() } },
@@ -681,7 +699,7 @@ struct DiskBrokerTests {
 
     /// Regression: DiskBroker is shared across multiple ChainNetwork actors.
     /// Without serialising complete write transactions, two actors calling
-    /// storeVolumeLocal concurrently can both pass SQLITE_OPEN_FULLMUTEX's
+    /// store(volume:) calls can concurrently pass SQLITE_OPEN_FULLMUTEX's
     /// per-call serialisation and then both issue BEGIN IMMEDIATE, causing the
     /// second to fail with "cannot start a transaction within a transaction".
     @Test("Concurrent writes from multiple actors do not produce nested-transaction errors")
@@ -689,14 +707,14 @@ struct DiskBrokerTests {
         let broker = try tempDB()
 
         // Simulate multiple ChainNetwork actors sharing the same DiskBroker.
-        // Each actor calls storeVolumeLocal concurrently; the write executor
+        // Each actor calls store(volume:) concurrently; the write executor
         // must serialise transactions so none overlap.
         let writeCount = 20
         try await withThrowingTaskGroup(of: Void.self) { group in
             for i in 0..<writeCount {
                 group.addTask {
                     let p = self.payload("root-\(i)", ["cid-\(i)": Data("data-\(i)".utf8)])
-                    try await broker.storeVolumeLocal(p)
+                    try await broker.store(volume: p)
                 }
             }
             try await group.waitForAll()
