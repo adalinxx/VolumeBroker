@@ -98,8 +98,7 @@ struct SchemaVersionTests {
             try execute(db, """
                 CREATE TABLE volume_metadata
                 (root TEXT PRIMARY KEY, entry_count INTEGER NOT NULL
-                CHECK (entry_count > 0), quarantined INTEGER NOT NULL DEFAULT 0
-                CHECK (typeof(quarantined) = 'integer' AND quarantined IN (0, 1)))
+                CHECK (typeof(entry_count) = 'integer'   AND entry_count > 0))
                 """)
         }
 
@@ -316,9 +315,7 @@ struct SchemaVersionTests {
             try execute(db, """
                 CREATE TABLE volume_metadata (
                     root TEXT PRIMARY KEY,
-                    entry_count INTEGER NOT NULL CHECK (entry_count > 0),
-                    quarantined INTEGER NOT NULL DEFAULT 1
-                        CHECK (typeof(quarantined) = 'integer' AND quarantined IN (0, 1))
+                    entry_count INTEGER NOT NULL CHECK (entry_count > 0)
                 )
                 """)
         }

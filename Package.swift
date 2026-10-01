@@ -13,11 +13,7 @@ let package = Package(
         .package(url: "https://github.com/swift-libp2p/swift-multihash.git", exact: "0.2.1"),
     ],
     targets: [
-        .target(
-            name: "VolumeBrokerSQLite",
-            publicHeadersPath: ".",
-            linkerSettings: [.linkedLibrary("sqlite3")]
-        ),
+        .systemLibrary(name: "VolumeBrokerSQLite"),
         .target(
             name: "VolumeBroker",
             dependencies: [

@@ -167,15 +167,6 @@ public final class MemoryBroker: @unchecked Sendable, RetainedRootMergeBroker {
         }
     }
 
-    public func isPinReachable(cid: String) async -> Bool {
-        lock.withReadLock {
-            let live = Self.liveRoots(state: state)
-            return state.ownersByCID[cid, default: []].contains { root in
-                live.contains(root) && Self.isComplete(root: root, state: state)
-            }
-        }
-    }
-
     @discardableResult
     public func sweep() async throws -> Int {
         lock.withWriteLock {

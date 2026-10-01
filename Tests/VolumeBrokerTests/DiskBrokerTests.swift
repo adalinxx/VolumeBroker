@@ -204,7 +204,6 @@ struct DiskBrokerTests {
 
         try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [keep])
 
-        #expect(await broker.isPinReachable(cid: keep))
         #expect(try await broker.retainedRoots(scope: "chain-a:state") == [keep])
         let evicted = try await broker.sweep()
         #expect(evicted == 1)
@@ -361,7 +360,6 @@ struct DiskBrokerTests {
         ])
 
         try await broker.advanceRetainedRoots(scope: "chain-a:state", roots: [object])
-        #expect(await broker.isPinReachable(cid: leaf))
         let evicted = try await broker.sweep()
 
         #expect(evicted == 1)

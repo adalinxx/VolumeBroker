@@ -68,10 +68,6 @@ public final class DiskBroker: @unchecked Sendable, RetainedRootMergeBroker {
         try await retainedRoots.retainedRoots(scope: scope)
     }
 
-    public func isPinReachable(cid: String) async -> Bool {
-        await retainedRoots.isPinReachable(cid: cid)
-    }
-
     @discardableResult
     public func sweep() async throws -> Int {
         try await retainedRoots.sweep()

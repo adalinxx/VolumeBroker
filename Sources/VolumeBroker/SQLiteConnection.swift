@@ -37,7 +37,6 @@ final class SQLiteConnection: @unchecked Sendable {
         }
         do {
             try Self.execRaw(db: handle, "PRAGMA busy_timeout=30000")
-            try Self.execRaw(db: handle, "PRAGMA auto_vacuum=INCREMENTAL")
             try Self.initializeSchemaIfNeeded(db: handle)
             try Self.configureWriteConnection(db: handle)
         } catch {
@@ -224,9 +223,8 @@ final class SQLiteConnection: @unchecked Sendable {
         ("volume_metadata", """
             CREATE TABLE volume_metadata (
                 root TEXT PRIMARY KEY,
-                entry_count INTEGER NOT NULL CHECK (entry_count > 0),
-                quarantined INTEGER NOT NULL DEFAULT 0
-                    CHECK (typeof(quarantined) = 'integer' AND quarantined IN (0, 1))
+                entry_count INTEGER NOT NULL
+                    CHECK (typeof(entry_count) = 'integer' AND entry_count > 0)
             )
             """),
         ("volume_entries", """
@@ -373,7 +371,6 @@ final class SQLiteConnection: @unchecked Sendable {
         try execRaw(db: db, "PRAGMA cache_size=-65536")
         try execRaw(db: db, "PRAGMA mmap_size=268435456")
         try execRaw(db: db, "PRAGMA temp_store=MEMORY")
-        try execRaw(db: db, "PRAGMA auto_vacuum=INCREMENTAL")
     }
 
     private static func enableForeignKeys(db: OpaquePointer) throws {

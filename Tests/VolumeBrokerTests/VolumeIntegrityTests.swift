@@ -14,7 +14,6 @@ import Darwin
 
 final class VolumeIntegrityTests: XCTestCase {
     private enum Corruption: Sendable {
-        case missingCASData
         case missingMembership
         case corruptBytes
     }
@@ -164,15 +163,6 @@ final class VolumeIntegrityTests: XCTestCase {
 
         try await connection.write {
             switch corruption {
-            case .missingCASData:
-                try connection.exec("PRAGMA foreign_keys=OFF")
-                do {
-                    try connection.exec("DELETE FROM cas_data WHERE cid='\(child)'")
-                    try connection.exec("PRAGMA foreign_keys=ON")
-                } catch {
-                    try? connection.exec("PRAGMA foreign_keys=ON")
-                    throw error
-                }
             case .missingMembership:
                 try connection.exec("DELETE FROM volume_entries WHERE root='\(root)' AND cid='\(child)'")
             case .corruptBytes:
@@ -750,21 +740,6 @@ final class VolumeIntegrityTests: XCTestCase {
 #endif
     }
 
-    func testMissingCASDataMakesManifestUnavailable() async throws {
-        try await withCorruptedStore(.missingCASData) { _, store, root, _ in
-            let present = await store.hasVolume(root: root)
-            XCTAssertFalse(present)
-        }
-        try await withCorruptedStore(.missingCASData) { _, store, root, _ in
-            let volume = await store.fetchVolumeLocal(root: root)
-            XCTAssertNil(volume)
-        }
-        try await withCorruptedStore(.missingCASData) { _, store, _, child in
-            let data = await store.fetchDataLocal(cid: child)
-            XCTAssertNil(data)
-        }
-    }
-
     func testMissingManifestMembershipFailsAllReadsClosed() async throws {
         try await withCorruptedStore(.missingMembership) { _, store, root, _ in
             let present = await store.hasVolume(root: root)
@@ -780,66 +755,36 @@ final class VolumeIntegrityTests: XCTestCase {
         }
     }
 
-    func testCorruptedCASBytesAreQuarantinedOnlyAfterReadProof() async throws {
-        try await withCorruptedStore(.corruptBytes) { _, store, root, _ in
-            let present = await store.hasVolume(root: root)
-            XCTAssertTrue(present, "presence is structural and does not hash every entry")
-        }
-        try await withCorruptedStore(.corruptBytes) { _, store, root, _ in
-            let volume = await store.fetchVolumeLocal(root: root)
-            XCTAssertNil(volume)
-            let present = await store.hasVolume(root: root)
-            XCTAssertFalse(present)
-        }
-        try await withCorruptedStore(.corruptBytes) { _, store, root, child in
-            let data = await store.fetchDataLocal(cid: child)
-            XCTAssertNil(data)
-            let present = await store.hasVolume(root: root)
-            XCTAssertFalse(present)
-        }
-    }
-
-    func testPointReadIgnoresCorruptSiblingUntilSiblingIsRequested() async throws {
+    /// Corrupt bytes fail CID validation on read and are not served. Nothing
+    /// is flagged or deleted: presence stays structural and valid siblings stay
+    /// readable.
+    func testCorruptBytesAreNotServedAndNothingElseChanges() async throws {
         try await withCorruptedStore(.corruptBytes) { connection, store, root, child in
-            let validData = await store.fetchDataLocal(cid: root)
-            let presentBeforeProof = await store.hasVolume(root: root)
-            XCTAssertEqual(validData, Data("root".utf8))
-            XCTAssertTrue(presentBeforeProof)
-
+            let volume = await store.fetchVolumeLocal(root: root)
             let corruptData = await store.fetchDataLocal(cid: child)
-            let presentAfterProof = await store.hasVolume(root: root)
+            let batch = await store.fetchDataLocal(cids: [root, child])
+            let validData = await store.fetchDataLocal(cid: root)
+            let present = await store.hasVolume(root: root)
+            XCTAssertNil(volume)
             XCTAssertNil(corruptData)
-            XCTAssertFalse(presentAfterProof)
+            XCTAssertEqual(batch, [root: Data("root".utf8)])
+            XCTAssertEqual(validData, Data("root".utf8))
+            XCTAssertTrue(present, "presence is structural and does not hash every entry")
 
             let preserved = try await connection.read {
                 (
                     try Self.scalarInt(connection.readDb, "SELECT COUNT(*) FROM volume_metadata"),
                     try Self.scalarInt(connection.readDb, "SELECT COUNT(*) FROM volume_entries"),
-                    try Self.scalarInt(connection.readDb, "SELECT COUNT(*) FROM cas_data"),
-                    try Self.scalarInt(
-                        connection.readDb,
-                        "SELECT quarantined FROM volume_metadata WHERE root='\(root)'"
-                    )
+                    try Self.scalarInt(connection.readDb, "SELECT COUNT(*) FROM cas_data")
                 )
             }
             XCTAssertEqual(preserved.0, 1)
             XCTAssertEqual(preserved.1, 2)
             XCTAssertEqual(preserved.2, 2)
-            XCTAssertEqual(preserved.3, 1)
         }
     }
 
-    func testBatchReadDoesNotReturnMembersWhoseOwnerWasQuarantined() async throws {
-        try await withCorruptedStore(.corruptBytes) { _, store, root, child in
-            let found = await store.fetchDataLocal(cids: [root, child])
-            let present = await store.hasVolume(root: root)
-
-            XCTAssertTrue(found.isEmpty)
-            XCTAssertFalse(present)
-        }
-    }
-
-    func testWholeVolumeProofQuarantinesEveryOwnerOfCorruptContent() async throws {
+    func testCorruptSharedContentFailsEveryOwningVolumeRead() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("VolumeIntegrityTests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -860,16 +805,10 @@ final class VolumeIntegrityTests: XCTestCase {
             try connection.exec("UPDATE cas_data SET data=X'00' WHERE cid='\(shared)'")
         }
 
-        let fetched = await store.fetchVolumeLocal(root: first)
-        let firstPresent = await store.hasVolume(root: first)
-        let secondPresent = await store.hasVolume(root: second)
-        XCTAssertNil(fetched)
-        XCTAssertFalse(firstPresent)
-        XCTAssertFalse(secondPresent)
-        let preservedRoots = try await connection.read {
-            try Self.scalarInt(connection.readDb, "SELECT COUNT(*) FROM volume_metadata")
-        }
-        XCTAssertEqual(preservedRoots, 2)
+        let firstVolume = await store.fetchVolumeLocal(root: first)
+        let secondVolume = await store.fetchVolumeLocal(root: second)
+        XCTAssertNil(firstVolume)
+        XCTAssertNil(secondVolume)
     }
 
     func testRetentionAdmissionUsesStructuralCompleteness() async throws {
@@ -881,36 +820,6 @@ final class VolumeIntegrityTests: XCTestCase {
             let roots = try await retained.retainedRoots(scope: "test")
             XCTAssertEqual(roots, [root])
         }
-    }
-
-    func testExactRestorageClearsQuarantineWhenContentStillMatches() async throws {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("VolumeIntegrityTests-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let connection = try SQLiteConnection(path: directory.appendingPathComponent("volumes.sqlite").path)
-        let store = CASVolumeStore(connection: connection)
-        let data = Data("republish".utf8)
-        let root = try cid(for: data)
-        let volume = SerializedVolume(root: root, entries: [root: data])
-        try await store.store(volume: volume)
-        try await connection.write {
-            try connection.exec("UPDATE volume_metadata SET quarantined=1 WHERE root='\(root)'")
-        }
-
-        let hidden = await store.hasVolume(root: root)
-        XCTAssertFalse(hidden)
-        try await store.store(volume: volume)
-        let restored = await store.hasVolume(root: root)
-        XCTAssertTrue(restored)
-
-        let quarantined = try await connection.read {
-            try Self.scalarInt(
-                connection.readDb,
-                "SELECT quarantined FROM volume_metadata WHERE root='\(root)'"
-            )
-        }
-        XCTAssertEqual(quarantined, 0)
     }
 
     func testAuthenticatedRestorageRepairsCorruptCASBytes() async throws {
@@ -940,21 +849,17 @@ final class VolumeIntegrityTests: XCTestCase {
         }
 
         let corruptShared = await store.fetchDataLocal(cid: shared)
-        let firstAfterProof = await store.hasVolume(root: first)
+        let firstBeforeRepair = await store.fetchVolumeLocal(root: first)
         XCTAssertNil(corruptShared)
-        XCTAssertFalse(firstAfterProof)
+        XCTAssertNil(firstBeforeRepair)
 
         try await store.store(volume: secondVolume)
-        let secondAfterRepair = await store.hasVolume(root: second)
         let repairedShared = await store.fetchDataLocal(cid: shared)
-        let firstStillQuarantined = await store.hasVolume(root: first)
-        XCTAssertTrue(secondAfterRepair)
+        let firstAfterRepair = await store.fetchVolumeLocal(root: first)
+        let secondAfterRepair = await store.fetchVolumeLocal(root: second)
         XCTAssertEqual(repairedShared, sharedData)
-        XCTAssertFalse(firstStillQuarantined)
-
-        try await store.store(volume: firstVolume)
-        let firstAfterRestorage = await store.hasVolume(root: first)
-        XCTAssertTrue(firstAfterRestorage)
+        XCTAssertEqual(firstAfterRepair?.entries, firstVolume.entries)
+        XCTAssertEqual(secondAfterRepair?.entries, secondVolume.entries)
         try await assertHealthy(connection)
     }
 

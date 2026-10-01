@@ -187,7 +187,7 @@ struct Benchmarks {
         #expect(await store.hasVolume(root: volume.root))
         #expect(await store.fetchDataLocal(cid: target) == expected)
         #expect(await store.fetchDataLocal(cid: corruptSibling) == nil)
-        #expect(await store.hasVolume(root: volume.root) == false)
+        #expect(await store.fetchVolumeLocal(root: volume.root) == nil)
     }
 
     // MARK: - Sweep

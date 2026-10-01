@@ -1,0 +1,5 @@
+module VolumeBrokerSQLite [system] {
+    header "shim.h"
+    link "sqlite3"
+    export *
+}

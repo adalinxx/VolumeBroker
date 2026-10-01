@@ -31,12 +31,12 @@ public protocol VolumeBroker: AnyObject, VolumeStorer, ContentSource, Fetcher {
 /// root is removed by the next `sweep`; a later advance naming it is then
 /// refused, so a retained root can never name content the broker lacks.
 public protocol RetainedRootBroker: VolumeBroker {
-    /// Atomically replace `scope`'s root set. Every root must be a complete
-    /// stored Volume, or nothing changes.
+    /// Atomically replace `scope`'s whole root set. Every root must be a
+    /// complete stored Volume, or nothing changes. A caller that both merges
+    /// and advances one scope must serialize them: an advance built from an
+    /// older snapshot drops every root merged after that snapshot.
     func advanceRetainedRoots(scope: String, roots: [String]) async throws
     func retainedRoots(scope: String) async throws -> [String]
-    /// True iff `cid` is a member of a live, complete Volume.
-    func isPinReachable(cid: String) async -> Bool
     /// Remove every unreachable Volume and unowned CAS row in one atomic step.
     /// Returns the number of Volumes removed.
     @discardableResult

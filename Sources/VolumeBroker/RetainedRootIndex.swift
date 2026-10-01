@@ -11,8 +11,7 @@ import VolumeBrokerSQLite
 struct RetainedRootIndex {
     let connection: SQLiteConnection
 
-    /// The single definition of liveness, shared by `isPinReachable` and
-    /// `sweep`. A root is live if a scope retains it, or if it is a member of a
+    /// The definition of liveness used by `sweep`. A root is live if a scope retains it, or if it is a member of a
     /// live, complete Volume and has its own `volume_metadata` row.
     static let liveRootsCTE = """
         WITH RECURSIVE live_roots(root) AS (
@@ -27,28 +26,7 @@ struct RetainedRootIndex {
         )
         """
 
-    /// True iff `cid` is a member of a live, complete Volume.
-    func isPinReachable(cid: String) async -> Bool {
-        await connection.read {
-            var stmt: OpaquePointer?
-            defer { sqlite3_finalize(stmt) }
-            let sql = """
-                \(Self.liveRootsCTE)
-                SELECT 1
-                FROM live_roots
-                JOIN volume_metadata vm ON vm.root = live_roots.root
-                JOIN volume_entries member ON member.root = vm.root AND member.cid = ?1
-                WHERE \(CASVolumeStore.completeVolumePredicate)
-                LIMIT 1
-                """
-            guard sqlite3_prepare_v2(connection.readDb, sql, -1, &stmt, nil) == SQLITE_OK,
-                  let stmt else { return false }
-            sqlite3_bind_text(stmt, 1, cid, -1, SQLITE_TRANSIENT_SHIM)
-            return sqlite3_step(stmt) == SQLITE_ROW
-        }
-    }
-
-    /// Delete every Volume that is not live (and its membership), then every
+    /// Delete every Volume that is not live (its membership cascades), then every
     /// CAS row no surviving Volume owns, in one transaction on the serial
     /// write connection. Advances and stores serialize against it there, so a
     /// root an advance commits first is live for the sweep, and an advance
@@ -62,12 +40,6 @@ struct RetainedRootIndex {
                     WHERE root NOT IN (SELECT root FROM live_roots)
                     """)
                 let removed = Int(sqlite3_changes(connection.db))
-                try connection.exec("""
-                    DELETE FROM volume_entries
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM volume_metadata vm WHERE vm.root = volume_entries.root
-                    )
-                    """)
                 try connection.exec("""
                     DELETE FROM cas_data
                     WHERE NOT EXISTS (

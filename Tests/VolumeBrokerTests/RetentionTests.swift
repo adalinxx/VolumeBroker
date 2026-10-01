@@ -56,16 +56,13 @@ struct RetentionTests {
         ])
         try await broker.advanceRetainedRoots(scope: "s", roots: [Self.cid("top")])
 
-        for leaf in ["top-leaf", "mid-leaf", "bottom-leaf"] {
-            #expect(await broker.isPinReachable(cid: Self.cid(leaf)), "\(leaf)")
-        }
-        #expect(await broker.isPinReachable(cid: Self.cid("stray-leaf")) == false)
-
         #expect(try await broker.sweep() == 1)
         for root in ["top", "mid", "bottom"] {
             #expect(await broker.hasVolume(root: Self.cid(root)), "\(root)")
         }
-        #expect(await broker.fetchDataLocal(cid: Self.cid("bottom-leaf")) == Data("bottom-leaf".utf8))
+        for leaf in ["top-leaf", "mid-leaf", "bottom-leaf"] {
+            #expect(await broker.fetchDataLocal(cid: Self.cid(leaf)) == Data(leaf.utf8), "\(leaf)")
+        }
         #expect(await broker.hasVolume(root: Self.cid("stray")) == false)
         #expect(await broker.fetchDataLocal(cid: Self.cid("stray-leaf")) == nil)
     }
@@ -157,7 +154,6 @@ struct RetentionTests {
     private struct Observation: Equatable {
         var result: String
         var volumes: [Bool]
-        var reachable: [Bool]
         var data: [Data?]
         var scopes: [[String]]
     }
@@ -182,12 +178,11 @@ struct RetentionTests {
         universe: [SerializedVolume],
         cids: [String]
     ) async throws -> Observation {
-        var observation = Observation(result: result, volumes: [], reachable: [], data: [], scopes: [])
+        var observation = Observation(result: result, volumes: [], data: [], scopes: [])
         for volume in universe {
             observation.volumes.append(await broker.hasVolume(root: volume.root))
         }
         for cid in cids {
-            observation.reachable.append(await broker.isPinReachable(cid: cid))
             observation.data.append(await broker.fetchDataLocal(cid: cid))
         }
         for scope in scopes {

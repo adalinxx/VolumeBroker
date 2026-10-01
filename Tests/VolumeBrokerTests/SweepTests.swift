@@ -10,7 +10,7 @@ import VolumeBrokerSQLite
 @testable import VolumeBroker
 
 /// SQL-level sweep tests over one shared `SQLiteConnection`, without the
-/// `DiskBroker` façade: damaged rows, quarantine, and SQL failures.
+/// `DiskBroker` façade: schema-forbidden states, corrupt bytes, and SQL failures.
 @Suite("Sweep")
 struct SweepTests {
 
@@ -57,17 +57,14 @@ struct SweepTests {
         #expect(await casRowCount(connection: h.connection, cid: cid("drop")) == 0)
     }
 
-    /// The serve gate and the sweep share one liveness definition.
-    @Test func liveRootServesAndSurvives() async throws {
+    @Test func retainedRootSurvives() async throws {
         let h = try harness()
         let root = cid("r1")
         try await h.store.store(volume: volume("r1"))
         try await h.retained.advanceRetainedRoots(scope: "s", roots: [root])
 
-        #expect(await h.retained.isPinReachable(cid: root))
         #expect(try await h.retained.sweep() == 0)
         #expect(await h.store.hasVolume(root: root))
-        #expect(await h.retained.isPinReachable(cid: root))
     }
 
     @Test func sharedBlobIsDeletedAfterLastOwner() async throws {
@@ -88,43 +85,6 @@ struct SweepTests {
         #expect(await h.store.fetchDataLocal(cid: sharedCID) == nil)
     }
 
-    @Test func danglingMembershipOwnsNothing() async throws {
-        let h = try harness()
-        let root = cid("dangling")
-        try await h.store.store(volume: volume("dangling"))
-        try await h.connection.write {
-            try h.connection.exec("PRAGMA foreign_keys=OFF")
-            do {
-                try h.connection.exec("DELETE FROM volume_metadata WHERE root='\(root)'")
-                try h.connection.exec("PRAGMA foreign_keys=ON")
-            } catch {
-                try? h.connection.exec("PRAGMA foreign_keys=ON")
-                throw error
-            }
-        }
-
-        #expect(!(await h.retained.isPinReachable(cid: root)))
-        #expect(try await h.retained.sweep() == 0)
-        #expect(await casRowCount(connection: h.connection, cid: root) == 0)
-    }
-
-    @Test func malformedUnretainedVolumeIsSwept() async throws {
-        let h = try harness()
-        let root = cid("real-count")
-        try await h.store.store(volume: volume("real-count"))
-        try await h.connection.write {
-            try h.connection.exec("""
-                UPDATE volume_metadata
-                SET entry_count=CAST(1.5 AS REAL)
-                WHERE root='\(root)'
-                """)
-        }
-
-        #expect(await h.store.hasVolume(root: root) == false)
-        #expect(try await h.retained.sweep() == 1)
-        #expect(await casRowCount(connection: h.connection, cid: root) == 0)
-    }
-
     @Test func retainedIntentSurvivesContentLoss() async throws {
         let h = try harness()
         let root = cid("lost")
@@ -138,42 +98,56 @@ struct SweepTests {
         #expect(try await h.retained.retainedRoots(scope: "canonical") == [root])
     }
 
-    /// A quarantined retained root is still live: the sweep keeps its bytes
-    /// for repair, but it is not served and its members do not extend
-    /// liveness. Valid republication restores both.
-    @Test func quarantinedRetainedRootIsKeptButNotServed() async throws {
+    /// The completeness predicate omits what the schema already enforces.
+    /// Each state it relies on being impossible is refused by SQLite.
+    @Test func schemaRefusesEveryStateThePredicateDoesNotCheck() async throws {
         let h = try harness()
-        let parentLabel = "corrupt"
-        let root = cid(parentLabel)
-        let child = volume("child")
-        try await h.store.storeVolumesLocal([
-            volume(parentLabel, ["child": Data("child".utf8)]),
-            child,
+        let root = cid("r1")
+        try await h.store.store(volume: volume("r1"))
+
+        let forbidden = [
+            // A member without a CAS row.
+            "INSERT INTO volume_entries(root, cid) VALUES('\(root)', 'no-content')",
+            // A member of a Volume with no metadata.
+            "INSERT INTO volume_entries(root, cid) VALUES('no-metadata', '\(root)')",
+            // Removing content a Volume still owns.
+            "DELETE FROM cas_data WHERE cid='\(root)'",
+            // A non-integer or nonpositive declared count.
+            "UPDATE volume_metadata SET entry_count=CAST(1.5 AS REAL) WHERE root='\(root)'",
+            "UPDATE volume_metadata SET entry_count=0 WHERE root='\(root)'",
+        ]
+        for sql in forbidden {
+            await #expect(throws: BrokerError.self, "\(sql)") {
+                try await h.connection.write { try h.connection.exec(sql) }
+            }
+        }
+        #expect(await h.store.fetchVolumeLocal(root: root)?.entries == volume("r1").entries)
+    }
+
+    /// Corrupt bytes are not served and flag nothing, so a read of a corrupt
+    /// leaf never shrinks the live closure.
+    @Test func corruptLeafReadThenSweepRemovesNothingReachable() async throws {
+        let h = try harness()
+        let top = SerializedVolume(root: cid("top"), entries: [
+            cid("top"): Data("top".utf8),
+            cid("mid"): Data("mid".utf8),
+            cid("top-leaf"): Data("top-leaf".utf8),
         ])
-        try await h.retained.advanceRetainedRoots(scope: "canonical", roots: [root])
+        let mid = volume("mid", ["mid-leaf": Data("mid-leaf".utf8)])
+        try await h.store.storeVolumesLocal([top, mid])
+        try await h.retained.advanceRetainedRoots(scope: "s", roots: [top.root])
         try await h.connection.write {
-            try h.connection.exec("UPDATE cas_data SET data=X'00' WHERE cid='\(root)'")
+            try h.connection.exec("UPDATE cas_data SET data=X'00' WHERE cid='\(cid("top-leaf"))'")
         }
-        #expect(await h.store.fetchVolumeLocal(root: root) == nil)
-        #expect(await h.store.hasVolume(root: root) == false)
-        #expect(await h.retained.isPinReachable(cid: root) == false)
+        #expect(await h.store.fetchDataLocal(cid: cid("top-leaf")) == nil)
+        #expect(await h.store.fetchVolumeLocal(root: top.root) == nil)
 
-        do {
-            try await h.retained.mergeRetainedRoots(scope: "candidate", roots: [root])
-            Issue.record("CID-invalid Volume must not become a retention root")
-        } catch {
-            #expect(error as? BrokerError == .missingRetainedRoot(root))
-        }
-
-        #expect(try await h.retained.sweep() == 1, "only the child loses liveness")
-        #expect(await casRowCount(connection: h.connection, cid: root) == 1)
-        #expect(await h.store.hasVolume(root: child.root) == false)
-        #expect(try await h.retained.retainedRoots(scope: "canonical") == [root])
-
-        try await h.store.store(volume: volume(parentLabel, ["child": Data("child".utf8)]))
         #expect(try await h.retained.sweep() == 0)
-        #expect(await h.store.hasVolume(root: root))
-        #expect(await h.retained.isPinReachable(cid: root))
+        #expect(await h.store.fetchVolumeLocal(root: mid.root)?.entries == mid.entries)
+        #expect(await casRowCount(connection: h.connection, cid: cid("top-leaf")) == 1)
+
+        try await h.store.store(volume: top)
+        #expect(await h.store.fetchVolumeLocal(root: top.root)?.entries == top.entries)
     }
 
     @Test func retainedRootReadPropagatesSQLFailure() async throws {
@@ -213,23 +187,6 @@ struct SweepTests {
         sqlite3_set_authorizer(h.connection.db, nil, nil)
         #expect(await h.store.hasVolume(root: cid("drop")))
         #expect(await casRowCount(connection: h.connection, cid: cid(for: shared)) == 1)
-    }
-
-    @Test func quarantineSQLFailureNeverDeletesContent() async throws {
-        let h = try harness()
-        let root = cid("sql-failure")
-        try await h.store.store(volume: volume("sql-failure"))
-        try await h.connection.write {
-            try h.connection.exec("UPDATE cas_data SET data=X'00' WHERE cid='\(root)'")
-        }
-
-        sqlite3_set_authorizer(h.connection.db, { _, action, _, _, _, _ in
-            action == SQLITE_READ ? SQLITE_DENY : SQLITE_OK
-        }, nil)
-        #expect(await h.store.fetchVolumeLocal(root: root) == nil)
-        sqlite3_set_authorizer(h.connection.db, nil, nil)
-
-        #expect(await casRowCount(connection: h.connection, cid: root) == 1)
     }
 
     private func casRowCount(connection: SQLiteConnection, cid: String) async -> Int {
