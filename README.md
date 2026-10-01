@@ -5,14 +5,16 @@ Atomic, Volume-granular content-addressed storage for
 
 A `SerializedVolume` is one root CID plus the exact `(CID, bytes)` entries
 published with it. VolumeBroker stores that set as one unit. It never walks DAG
-links or infers relationships between Volumes.
+links; the only relationship it knows is Volume membership. It knows nothing
+about chains.
 
 ## Contract
 
 - A Volume is visible only after its complete, CID-valid entry set commits.
 - Valid CID bytes and Volume membership are immutable.
 - Reads may fall through `local -> near -> far`; writes target one broker.
-- Pins and retained-root sets protect only the Volume roots named by the caller.
+- Retained roots keep everything reachable from them through Volume membership;
+  `sweep` removes the rest.
 - Equal CIDs are deduplicated within each broker tier.
 
 One cascade is one storage domain. Use separate brokers or database paths when
@@ -24,7 +26,7 @@ data must be isolated.
 import VolumeBroker
 
 let disk = try DiskBroker(path: "/var/lib/my-app/volumes.sqlite")
-let memory = MemoryBroker(byteBudget: 64 * 1024 * 1024, near: disk)
+let memory = MemoryBroker(near: disk)
 ```
 
 Reads now try memory and then disk. Stores remain explicit.
@@ -55,55 +57,49 @@ storage tier.
 
 ## Retention
 
-Pins are additive per `(root, owner)` and require a published local Volume:
+A scope is a name; a retained root is a complete stored Volume root. Advancing
+a scope atomically replaces its root set and refuses any root that is not a
+complete stored Volume, so a retained root never names content the broker lacks:
 
 ```swift
-try await disk.pin(root: rootCID, owner: "sync:42")
-try await disk.pin(root: rootCID, owner: "cache", ttl: .seconds(3_600))
-try await disk.unpin(root: rootCID, owner: "sync:42")
+try await disk.advanceRetainedRoots(scope: "canonical", roots: [stateRoot])
 ```
 
-`DiskBroker` can also replace a named retained-root set atomically:
+`mergeRetainedRoots` adds roots without replacing the set. Replacing a scope
+with the same set and merging roots already in it are naturally idempotent.
+
+A Volume root is live if a scope retains it, or if it is a member CID of a
+live, complete Volume and is itself a stored Volume root. Liveness is recursive.
 
 ```swift
-try await disk.advanceRetainedRoots(
-    scope: "state:canonical",
-    roots: materializedVolumeRoots
-)
+let removed = try await disk.sweep()
 ```
 
-Replacing a scope with the same root set is naturally idempotent, as is merging
-roots already in the set. `mergeRetainedRoots` adds roots without replacing the
-set. Pin-count mutations are not replay-deduplicated. The node or application
-must durably own transition identity, ordering, and replay policy.
-
-```swift
-let evicted = try await disk.evictUnpinned()
-```
-
-Eviction prunes expired pins, removes old unprotected Volumes, then removes CAS
-bytes with no remaining Volume owner. Shared bytes survive until their last
-owner is removed.
+`sweep` removes every Volume that is not live, then every CAS row no surviving
+Volume owns, in one transaction. It has no grace window: content stored but not
+yet retained is swept, and a later advance naming it is refused. Callers store,
+then advance, and sweep only between their own commits.
 
 ## Implementations
 
-- `MemoryBroker` supports count or byte limits and LRU eviction.
-- `DiskBroker` uses SQLite, WAL, foreign keys, deliberate `synchronous=FULL`
-  durability, and schema v1 validation.
+- `MemoryBroker` is the in-memory twin with identical retention semantics.
+- `DiskBroker` uses SQLite, WAL, foreign keys, and schema v2 validation. With
+  `synchronous=FULL`, each commit is fsynced to the WAL before it returns, so a
+  `store` that returns survives a crash.
 - Every broker is directly usable as Cashew's `VolumeStorer`, `ContentSource`,
   and `Fetcher`.
 
-`DiskBroker` initializes only an empty v0 database. A nonempty v0 store requires
-a new database path or explicit export/rematerialization. Malformed v1 and
-future schemas fail closed.
+`DiskBroker` initializes only an empty v0 database. Any other version, including
+v1 (owner/count pins), fails closed with `migrationRequired`; rebuild from a new
+database path. Malformed v2 schemas fail closed.
 
 ## Boundary
 
 | VolumeBroker owns | The caller owns |
 | --- | --- |
 | Volume validation and atomic publication | DAG traversal and Volume selection |
-| Local CAS, read cascading, and eviction | Storage placement and domain isolation |
-| Pins and retained-root sets | Which materialized roots remain live |
+| Local CAS, read cascading, and the reachability sweep | Storage placement and domain isolation |
+| Retained-root sets and recursive reachability | Which roots are retained, and when to sweep |
 | Storage integrity | Application state, canonicity, and consensus |
 
 See [correctness invariants](docs/correctness-invariants.md) for the review

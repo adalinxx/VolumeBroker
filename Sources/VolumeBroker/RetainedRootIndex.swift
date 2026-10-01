@@ -5,11 +5,79 @@ import SQLite3
 import VolumeBrokerSQLite
 #endif
 
-/// Named root sets that act as durable GC/serve roots outside the owner/count
-/// pin index. Replacing a scope with the same set and merging existing roots are
-/// naturally idempotent.
+/// Named retained-root sets, the reachability they define, and the sweep that
+/// reclaims everything else. Replacing a scope with the same set and merging
+/// existing roots are naturally idempotent.
 struct RetainedRootIndex {
     let connection: SQLiteConnection
+
+    /// The single definition of liveness, shared by `isPinReachable` and
+    /// `sweep`. A root is live if a scope retains it, or if it is a member of a
+    /// live, complete Volume and has its own `volume_metadata` row.
+    static let liveRootsCTE = """
+        WITH RECURSIVE live_roots(root) AS (
+            SELECT root FROM retained_roots
+            UNION
+            SELECT member.cid
+            FROM live_roots
+            JOIN volume_metadata vm ON vm.root = live_roots.root
+            JOIN volume_entries member ON member.root = vm.root
+            JOIN volume_metadata child ON child.root = member.cid
+            WHERE \(CASVolumeStore.completeVolumePredicate)
+        )
+        """
+
+    /// True iff `cid` is a member of a live, complete Volume.
+    func isPinReachable(cid: String) async -> Bool {
+        await connection.read {
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            let sql = """
+                \(Self.liveRootsCTE)
+                SELECT 1
+                FROM live_roots
+                JOIN volume_metadata vm ON vm.root = live_roots.root
+                JOIN volume_entries member ON member.root = vm.root AND member.cid = ?1
+                WHERE \(CASVolumeStore.completeVolumePredicate)
+                LIMIT 1
+                """
+            guard sqlite3_prepare_v2(connection.readDb, sql, -1, &stmt, nil) == SQLITE_OK,
+                  let stmt else { return false }
+            sqlite3_bind_text(stmt, 1, cid, -1, SQLITE_TRANSIENT_SHIM)
+            return sqlite3_step(stmt) == SQLITE_ROW
+        }
+    }
+
+    /// Delete every Volume that is not live (and its membership), then every
+    /// CAS row no surviving Volume owns, in one transaction on the serial
+    /// write connection. Advances and stores serialize against it there, so a
+    /// root an advance commits first is live for the sweep, and an advance
+    /// that runs after it sees exactly what survived.
+    func sweep() async throws -> Int {
+        try await connection.write {
+            try connection.transaction {
+                try connection.exec("""
+                    \(Self.liveRootsCTE)
+                    DELETE FROM volume_metadata
+                    WHERE root NOT IN (SELECT root FROM live_roots)
+                    """)
+                let removed = Int(sqlite3_changes(connection.db))
+                try connection.exec("""
+                    DELETE FROM volume_entries
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM volume_metadata vm WHERE vm.root = volume_entries.root
+                    )
+                    """)
+                try connection.exec("""
+                    DELETE FROM cas_data
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM volume_entries ve WHERE ve.cid = cas_data.cid
+                    )
+                    """)
+                return removed
+            }
+        }
+    }
 
     func advanceRetainedRoots(scope: String, roots: [String]) async throws {
         let canonicalRoots = try Self.canonicalRoots(roots)

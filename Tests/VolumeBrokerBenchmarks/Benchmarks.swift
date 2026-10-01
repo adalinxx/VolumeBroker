@@ -190,75 +190,33 @@ struct Benchmarks {
         #expect(await store.hasVolume(root: volume.root) == false)
     }
 
-    // MARK: - DiskBroker Pin/Unpin
+    // MARK: - Sweep
 
-    @Test func diskPinUnpin() async throws {
-        let broker = try tempDB()
-        for i in 0..<100 {
-            try await broker.store(volume: payload("r-\(i)", entryCount: 5))
-        }
-        print("\n--- DiskBroker: Pin/unpin operations ---")
-        try await measure("pin 1000 times", iterations: 1000) {
-            try await broker.pin(root: cid("r-\(Int.random(in: 0..<100))"), owner: "owner-\(Int.random(in: 0..<10))")
-        }
-        try await measure("unpin 1000 times", iterations: 1000) {
-            try await broker.unpin(root: cid("r-\(Int.random(in: 0..<100))"), owner: "owner-\(Int.random(in: 0..<10))")
-        }
-    }
-
-    // MARK: - DiskBroker Eviction
-
-    @Test func diskEviction() async throws {
-        print("\n--- DiskBroker: Eviction (500 volumes, 50 pinned) ---")
+    @Test func diskSweep() async throws {
+        print("\n--- DiskBroker: Sweep (500 volumes, 50 retained) ---")
         let broker = try tempDB()
         for i in 0..<500 {
             try await broker.store(volume: payload("r-\(i)", entryCount: 10))
         }
-        for i in 0..<50 {
-            try await broker.pin(root: cid("r-\(i)"), owner: "keeper")
-        }
-        try await measure("evict 450 unpinned volumes", iterations: 1) {
-            // graceSeconds: 0 — exercise eviction mechanics, not the store-then-pin grace
-            let evicted = try await broker.evictUnpinned(graceSeconds: 0)
-            #expect(evicted == 450)
+        try await broker.advanceRetainedRoots(scope: "keeper", roots: (0..<50).map { cid("r-\($0)") })
+        try await measure("sweep 450 unretained volumes", iterations: 1) {
+            let swept = try await broker.sweep()
+            #expect(swept == 450)
         }
         #expect(await broker.hasVolume(root: cid("r-0")))
         #expect(await broker.hasVolume(root: cid("r-499")) == false)
     }
 
-    // MARK: - MemoryBroker LRU
-
-    @Test func memoryLRUThroughput() async throws {
-        let broker = MemoryBroker(capacity: 500)
-        print("\n--- MemoryBroker: LRU store+fetch throughput (cap=500) ---")
-        var storeIndex = 0
-        try await measure("store 5000 volumes", iterations: 5000) {
-            let p = payload("r-\(storeIndex)", entryCount: 5)
-            storeIndex += 1
-            try await broker.store(volume: p)
-        }
-        var fetchIndex = 0
-        var hits = 0
-        try await measure("fetch 5000 times", iterations: 5000) {
-            if await broker.fetchVolumeLocal(root: cid("r-\(fetchIndex)")) != nil { hits += 1 }
-            fetchIndex += 1
-        }
-        #expect(hits == 500)
-    }
-
-    @Test func memoryLRUEviction() async throws {
-        // grace .zero — exercise eviction mechanics, not the store-then-pin grace
-        let broker = MemoryBroker(evictUnpinnedGrace: .zero)
+    @Test func memorySweep() async throws {
+        let broker = MemoryBroker()
         for i in 0..<1000 {
             try await broker.store(volume: payload("r-\(i)", entryCount: 5))
         }
-        for i in 0..<100 {
-            try await broker.pin(root: cid("r-\(i)"), owner: "keeper")
-        }
-        print("\n--- MemoryBroker: Evict 900 of 1000 volumes ---")
-        try await measure("evictUnpinned", iterations: 1) {
-            let evicted = try await broker.evictUnpinned()
-            #expect(evicted == 900)
+        try await broker.advanceRetainedRoots(scope: "keeper", roots: (0..<100).map { cid("r-\($0)") })
+        print("\n--- MemoryBroker: Sweep 900 of 1000 volumes ---")
+        try await measure("sweep", iterations: 1) {
+            let swept = try await broker.sweep()
+            #expect(swept == 900)
         }
     }
 
@@ -351,7 +309,7 @@ struct Benchmarks {
 
     @Test func cascadeFetchPerformance() async throws {
         let disk = try tempDB()
-        let memory = MemoryBroker(capacity: 50, near: disk)
+        let memory = MemoryBroker(near: disk)
 
         for i in 0..<200 {
             try await disk.store(volume: payload("r-\(i)", entryCount: 10))

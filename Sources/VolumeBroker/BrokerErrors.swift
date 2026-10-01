@@ -3,10 +3,7 @@ public enum BrokerError: Error, Sendable, Equatable {
     case sqlFailed(String)
     case migrationRequired(found: Int, required: Int)
     case invalidSchema(version: Int)
-    case capacityExceeded
     case notFound
-    case invalidPinCount
-    case invalidPinTTL
     case invalidRetainedRoots(String)
     case missingRetainedRoot(String)
     case inconsistentState(String)

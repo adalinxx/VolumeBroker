@@ -693,6 +693,63 @@ final class VolumeIntegrityTests: XCTestCase {
 #endif
     }
 
+    /// A crash after `store` but before `advanceRetainedRoots` keeps the old
+    /// retained tree whole; the next sweep removes the unreferenced new content.
+    func testCrashBetweenStoreAndAdvanceKeepsOldRootAndSweepsNewContent() async throws {
+#if os(macOS)
+        if sanitizerIsActive() {
+            throw XCTSkip("instrumented xctest bundles cannot be safely re-launched through xcrun")
+        }
+        let childPathKey = "VOLUME_BROKER_CRASH_CHILD_PATH"
+        func volume(_ label: String, _ members: [String]) throws -> SerializedVolume {
+            var entries = [try cid(for: Data(label.utf8)): Data(label.utf8)]
+            for member in members { entries[try cid(for: Data(member.utf8))] = Data(member.utf8) }
+            return SerializedVolume(root: try cid(for: Data(label.utf8)), entries: entries)
+        }
+        let old = try volume("old", ["shared", "old-leaf"])
+        let shared = try volume("shared", ["shared-leaf"])
+        let new = try volume("new", ["shared", "new-leaf"])
+
+        if let childPath = ProcessInfo.processInfo.environment[childPathKey] {
+            let broker = try DiskBroker(path: childPath)
+            try await broker.storeVolumesLocal([old, shared])
+            try await broker.advanceRetainedRoots(scope: "s", roots: [old.root])
+            try await broker.store(volume: new)
+            Darwin._exit(0)
+        }
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VolumeIntegrityTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("volumes.sqlite").path
+        let child = try await runChild(
+            testName: "testCrashBetweenStoreAndAdvanceKeepsOldRootAndSweepsNewContent",
+            environment: [childPathKey: path]
+        )
+        XCTAssertEqual(child.status, 0, child.output)
+
+        let reopened = try DiskBroker(path: path)
+        let retained = try await reopened.retainedRoots(scope: "s")
+        XCTAssertEqual(retained, [old.root])
+        let newStored = await reopened.hasVolume(root: new.root)
+        XCTAssertTrue(newStored, "a returned store is durable")
+
+        let swept = try await reopened.sweep()
+        XCTAssertEqual(swept, 1)
+        let oldVolume = await reopened.fetchVolumeLocal(root: old.root)
+        let sharedVolume = await reopened.fetchVolumeLocal(root: shared.root)
+        let newVolume = await reopened.fetchVolumeLocal(root: new.root)
+        let newLeaf = await reopened.fetchDataLocal(cid: try cid(for: Data("new-leaf".utf8)))
+        XCTAssertEqual(oldVolume?.entries, old.entries)
+        XCTAssertEqual(sharedVolume?.entries, shared.entries)
+        XCTAssertNil(newVolume)
+        XCTAssertNil(newLeaf)
+#else
+        throw XCTSkip("self-reexecuting an xctest bundle is currently macOS-only")
+#endif
+    }
+
     func testMissingCASDataMakesManifestUnavailable() async throws {
         try await withCorruptedStore(.missingCASData) { _, store, root, _ in
             let present = await store.hasVolume(root: root)
@@ -815,17 +872,13 @@ final class VolumeIntegrityTests: XCTestCase {
         XCTAssertEqual(preservedRoots, 2)
     }
 
-    func testPinAndRetentionAdmissionUseStructuralCompleteness() async throws {
+    func testRetentionAdmissionUsesStructuralCompleteness() async throws {
         try await withCorruptedStore(.corruptBytes) { connection, _, root, _ in
-            let pins = PinIndex(connection: connection)
             let retained = RetainedRootIndex(connection: connection)
 
-            try await pins.pin(root: root, owner: "test", count: 1, ttl: nil)
             try await retained.advanceRetainedRoots(scope: "test", roots: [root])
 
-            let owners = await pins.owners(root: root)
             let roots = try await retained.retainedRoots(scope: "test")
-            XCTAssertEqual(owners, ["test"])
             XCTAssertEqual(roots, [root])
         }
     }
