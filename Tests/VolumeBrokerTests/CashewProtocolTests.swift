@@ -37,11 +37,6 @@ struct CashewProtocolTests {
             return Dictionary(uniqueKeysWithValues: cids.map { ($0, Data($0.utf8)) })
         }
         func storeVolumesLocal(_ volumes: [SerializedVolume]) async throws {}
-        func pin(root: String, owner: String, count: Int, ttl: Duration?) async throws {}
-        func unpin(root: String, owner: String, count: Int) async throws {}
-        func unpinAll(owner: String) async throws {}
-        func owners(root: String) async -> Set<String> { [] }
-        func evictUnpinned() async throws -> Int { 0 }
 
         var counts: (scalar: Int, batch: Int) {
             lock.withLock { (scalarReads, batchReads) }
@@ -69,11 +64,6 @@ struct CashewProtocolTests {
             }
             try await backing.storeVolumesLocal(volumes)
         }
-        func pin(root: String, owner: String, count: Int, ttl: Duration?) async throws {}
-        func unpin(root: String, owner: String, count: Int) async throws {}
-        func unpinAll(owner: String) async throws {}
-        func owners(root: String) async -> Set<String> { [] }
-        func evictUnpinned() async throws -> Int { 0 }
     }
 
     @Test func brokerIsTheCashewBoundary() {

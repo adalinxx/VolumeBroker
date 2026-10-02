@@ -11,10 +11,10 @@ let SQLITE_TRANSIENT_SHIM = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 ///
 /// Owns the write and read connections, PRAGMA/schema setup, the read/write
 /// dispatch queues that serialise SQL access, and the raw `exec`/`execBind`
-/// primitives the higher layers build on. Higher layers (CAS store, pin index,
-/// eviction, metadata) compose this type and never open SQLite handles directly.
+/// primitives the higher layers build on. Higher layers (CAS store, retained
+/// roots) compose this type and never open SQLite handles directly.
 final class SQLiteConnection: @unchecked Sendable {
-    private static let schemaVersion = 1
+    private static let schemaVersion = 2
 
     private let readQueue = DispatchQueue(label: "VolumeBroker.DiskBroker.read", qos: .utility, attributes: .concurrent)
     private let writeQueue = DispatchQueue(label: "VolumeBroker.DiskBroker.write", qos: .utility)
@@ -37,7 +37,6 @@ final class SQLiteConnection: @unchecked Sendable {
         }
         do {
             try Self.execRaw(db: handle, "PRAGMA busy_timeout=30000")
-            try Self.execRaw(db: handle, "PRAGMA auto_vacuum=INCREMENTAL")
             try Self.initializeSchemaIfNeeded(db: handle)
             try Self.configureWriteConnection(db: handle)
         } catch {
@@ -224,10 +223,8 @@ final class SQLiteConnection: @unchecked Sendable {
         ("volume_metadata", """
             CREATE TABLE volume_metadata (
                 root TEXT PRIMARY KEY,
-                entry_count INTEGER NOT NULL CHECK (entry_count > 0),
-                quarantined INTEGER NOT NULL DEFAULT 0
-                    CHECK (typeof(quarantined) = 'integer' AND quarantined IN (0, 1)),
-                stored_at TEXT NOT NULL DEFAULT (datetime('now'))
+                entry_count INTEGER NOT NULL
+                    CHECK (typeof(entry_count) = 'integer' AND entry_count > 0)
             )
             """),
         ("volume_entries", """
@@ -235,15 +232,6 @@ final class SQLiteConnection: @unchecked Sendable {
                 root TEXT NOT NULL REFERENCES volume_metadata(root) ON DELETE CASCADE,
                 cid TEXT NOT NULL REFERENCES cas_data(cid),
                 PRIMARY KEY (root, cid)
-            )
-            """),
-        ("volume_pins", """
-            CREATE TABLE volume_pins (
-                root TEXT NOT NULL REFERENCES volume_metadata(root) ON DELETE CASCADE,
-                owner TEXT NOT NULL,
-                count INTEGER NOT NULL DEFAULT 1 CHECK (typeof(count) = 'integer' AND count > 0),
-                expires_at TEXT,
-                PRIMARY KEY (root, owner)
             )
             """),
         ("retained_roots", """
@@ -259,9 +247,6 @@ final class SQLiteConnection: @unchecked Sendable {
         ("idx_ve_cid", "CREATE INDEX idx_ve_cid ON volume_entries(cid)"),
         ("idx_ve_root", "CREATE INDEX idx_ve_root ON volume_entries(root)"),
         ("idx_retained_roots_root", "CREATE INDEX idx_retained_roots_root ON retained_roots(root)"),
-        ("idx_vp_owner", "CREATE INDEX idx_vp_owner ON volume_pins(owner)"),
-        ("idx_vp_owner_expires_root", "CREATE INDEX idx_vp_owner_expires_root ON volume_pins(owner, expires_at, root)"),
-        ("idx_vp_expires", "CREATE INDEX idx_vp_expires ON volume_pins(expires_at)"),
     ]
 
     private static func validateSchema(db: OpaquePointer) throws {
@@ -386,7 +371,6 @@ final class SQLiteConnection: @unchecked Sendable {
         try execRaw(db: db, "PRAGMA cache_size=-65536")
         try execRaw(db: db, "PRAGMA mmap_size=268435456")
         try execRaw(db: db, "PRAGMA temp_store=MEMORY")
-        try execRaw(db: db, "PRAGMA auto_vacuum=INCREMENTAL")
     }
 
     private static func enableForeignKeys(db: OpaquePointer) throws {
@@ -400,13 +384,4 @@ final class SQLiteConnection: @unchecked Sendable {
         for table in tableSchemas { try execRaw(db: db, table.sql) }
         for index in indexSchemas { try execRaw(db: db, index.sql) }
     }
-}
-
-extension SQLiteConnection {
-    /// Shared ISO8601 formatter for `expires_at` timestamps.
-    static nonisolated(unsafe) let isoFormatter: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f
-    }()
 }

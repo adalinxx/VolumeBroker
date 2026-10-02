@@ -10,26 +10,24 @@ Retention never substitutes for publication.
 | VOLUME-003 | A batch owns a copied snapshot and publishes all valid Volumes or none. |
 | VOLUME-004 | Valid existing CID content cannot acquire different bytes; invalid local bytes may be repaired only by submitted bytes that authenticate to that CID. |
 | VOLUME-005 | An existing Volume root cannot acquire different membership. |
-| VOLUME-006 | Declared count, membership, owned CAS rows, root membership, and quarantine state must agree before publication. |
+| VOLUME-006 | Declared count, membership, and root membership must agree before publication. Foreign keys guarantee every member has a CAS row and metadata; the schema guarantees an integer, positive declared count. |
 | VOLUME-007 | Cashew completes one independently durable selected Volume per `VolumeStorer` callback; a caller with a preassembled all-or-none batch may use `storeVolumesLocal`. |
-| VOLUME-008 | Loose rows, dangling membership, malformed metadata, and quarantined Volumes grant no visibility or ownership; requested bytes are returned only after CID validation. |
-| VOLUME-009 | Pins and retained-root sets accept published local roots and protect only those roots. |
-| VOLUME-010 | Retained-set replacement and merge are naturally idempotent. Pin-count mutations are not replay-deduplicated; the caller owns durable transition replay. |
-| VOLUME-011 | A bounded memory store rejects a batch before mutation if protected and submitted Volumes cannot fit. |
-| VOLUME-012 | Shared CAS bytes remain until their last owning Volume is removed; eviction never decrements pins. |
+| VOLUME-008 | Loose CAS rows and incomplete membership grant no visibility; requested bytes are returned only after CID validation. |
+| VOLUME-009 | Retained-root sets accept only complete local roots, all-or-none. A root is live if retained, or if it is a member of a live, complete Volume and is itself a stored Volume root. One recursive definition drives the sweep; `MemoryBroker` mirrors it. |
+| VOLUME-010 | Retained-set replacement and merge are naturally idempotent. Advance replaces the whole set, so a caller that both merges and advances one scope serializes them. |
+| VOLUME-011 | `sweep` removes every non-live Volume and then every unowned CAS row in one transaction, serialized with stores and advances; it has no grace window. |
+| VOLUME-012 | Shared CAS bytes remain until their last owning Volume is removed. |
 | VOLUME-013 | Immutable `near` and `far` links are read tiers in one domain; writes and cross-domain synchronization are explicit. |
 | VOLUME-014 | Empty v0 initializes atomically; malformed, nonempty, and unsupported schemas are not mutated. |
 | VOLUME-015 | Chain state, canonicity, and application metadata cannot bypass the Volume contract. |
-| VOLUME-016 | Presence and pin reachability use the structural serve gate; a point read validates only its requested `(CID, bytes)`, while a whole-Volume read validates the whole Volume. |
-| VOLUME-017 | A proved read mismatch durably quarantines every manifest owning the mismatched CID without deleting bytes or intent; explicit eviction performs and counts reclamation. |
-| VOLUME-018 | SQLite WAL with `synchronous=FULL` is a deliberate durable-commit boundary. |
-| VOLUME-019 | A batched CID read applies the same complete-owner serve gate, CID validation, quarantine, and local-to-far precedence as scalar reads. |
+| VOLUME-016 | Presence and liveness use the structural gate; a point read validates only its requested `(CID, bytes)`, while a whole-Volume read validates the whole Volume. |
+| VOLUME-017 | Corrupt bytes fail CID validation on read and are not served; nothing is flagged or deleted, liveness is unchanged, and a valid re-store overwrites them. |
+| VOLUME-018 | SQLite WAL with `synchronous=FULL` is the durable-commit boundary: a returned store survives a crash, so a later advance never names lost content. |
+| VOLUME-019 | A batched CID read applies the same complete-owner serve gate, CID validation and local-to-far precedence as scalar reads. |
 
-Corruption is quarantined only after it is proved; a database error is not proof
-of corruption. Quarantine preserves pins and retained intent. Explicit eviction
-may remove the manifest and its pins; retained-root sets remain authoritative,
-so valid republication reactivates retained policy.
+A read never writes: corruption only hides the corrupt bytes from readers, so a
+database error or a corrupt leaf can never shrink what a retained root keeps.
 
 Primary coverage: `VolumeIntegrityTests`, `MemoryBrokerTests`,
-`DiskBrokerTests`, `PinIndexTests`, `EvictionEngineTests`,
+`DiskBrokerTests`, `RetentionTests`, `SweepTests`,
 `SchemaVersionTests`, and `CashewProtocolTests`.

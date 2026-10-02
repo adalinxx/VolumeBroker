@@ -15,23 +15,32 @@ public protocol VolumeBroker: AnyObject, VolumeStorer, ContentSource, Fetcher {
     func fetchDataLocal(cid: String) async -> Data?
     /// Fetch multiple locally owned entries in one backend pass.
     func fetchDataLocal(cids: Set<String>) async -> [String: Data]
+    /// Publish the batch all-or-none. A durable broker returns only after the
+    /// batch survives a crash.
     func storeVolumesLocal(_ volumes: [SerializedVolume]) async throws
-
-    func pin(root: String, owner: String, count: Int, ttl: Duration?) async throws
-    func pinBatch(roots: [String], owner: String) async throws
-    func unpin(root: String, owner: String, count: Int) async throws
-    func unpinBatch(items: [(root: String, owner: String, count: Int)]) async throws
-    func unpinAll(owner: String) async throws
-    func owners(root: String) async -> Set<String>
-    func evictUnpinned() async throws -> Int
 }
 
-/// Optional retention surface for brokers that can atomically advance a named
-/// set of roots. Retained roots are independent from owner/count pins and
-/// protect the named Volumes from eviction.
+/// Retention surface: named scopes of retained Volume roots.
+///
+/// A Volume root is live if a scope retains it, or if it is a member CID of a
+/// live, complete Volume and is itself a stored Volume root. Liveness is
+/// recursive through Volume membership. `sweep` removes every Volume that is
+/// not live and then every CAS row no surviving Volume owns.
+///
+/// Storing does not retain. Content stored but not yet named by a retained
+/// root is removed by the next `sweep`; a later advance naming it is then
+/// refused, so a retained root can never name content the broker lacks.
 public protocol RetainedRootBroker: VolumeBroker {
+    /// Atomically replace `scope`'s whole root set. Every root must be a
+    /// complete stored Volume, or nothing changes. A caller that both merges
+    /// and advances one scope must serialize them: an advance built from an
+    /// older snapshot drops every root merged after that snapshot.
     func advanceRetainedRoots(scope: String, roots: [String]) async throws
     func retainedRoots(scope: String) async throws -> [String]
+    /// Remove every unreachable Volume and unowned CAS row in one atomic step.
+    /// Returns the number of Volumes removed.
+    @discardableResult
+    func sweep() async throws -> Int
 }
 
 /// Optional retained-root surface for brokers that can atomically add roots to
@@ -54,42 +63,6 @@ public extension VolumeBroker {
             throw BrokerError.notFound
         }
         return data
-    }
-
-    /// Convenience fallback for brokers without a native batch transaction.
-    /// A thrown error may leave a successfully applied prefix pinned.
-    func pinBatch(roots: [String], owner: String) async throws {
-        for root in roots { try await pin(root: root, owner: owner) }
-    }
-
-    /// Convenience fallback for brokers without a native batch transaction.
-    /// A thrown error may leave a successfully applied prefix unpinned.
-    func unpinBatch(
-        items: [(root: String, owner: String, count: Int)]
-    ) async throws {
-        for item in items {
-            try await unpin(
-                root: item.root,
-                owner: item.owner,
-                count: item.count
-            )
-        }
-    }
-
-    func pin(root: String, owner: String) async throws {
-        try await pin(root: root, owner: owner, count: 1, ttl: nil)
-    }
-
-    func pin(root: String, owner: String, ttl: Duration?) async throws {
-        try await pin(root: root, owner: owner, count: 1, ttl: ttl)
-    }
-
-    func pin(root: String, owner: String, count: Int) async throws {
-        try await pin(root: root, owner: owner, count: count, ttl: nil)
-    }
-
-    func unpin(root: String, owner: String) async throws {
-        try await unpin(root: root, owner: owner, count: 1)
     }
 
     func fetchVolume(root: String) async -> SerializedVolume? {

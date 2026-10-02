@@ -69,7 +69,7 @@ struct SchemaVersionTests {
         return try CID(version: .v1, codec: .dag_cbor, multihash: multihash).toBaseEncodedString
     }
 
-    @Test func freshDatabaseInitializesV1AndReopens() async throws {
+    @Test func freshDatabaseInitializesV2AndReopens() async throws {
         let location = try temporaryDatabase()
         defer { try? FileManager.default.removeItem(at: location.directory) }
         let data = Data("root".utf8)
@@ -81,7 +81,7 @@ struct SchemaVersionTests {
 
         try withDatabase(at: location.path) { db in
             let version = try scalar(db, "PRAGMA user_version")
-            #expect(version == 1)
+            #expect(version == 2)
         }
 
         let reopened = try DiskBroker(path: location.path)
@@ -89,7 +89,7 @@ struct SchemaVersionTests {
         #expect(await broker.hasVolume(root: root))
     }
 
-    @Test func equivalentWhitespaceV1MetadataSchemaReopens() throws {
+    @Test func equivalentWhitespaceV2MetadataSchemaReopens() throws {
         let location = try temporaryDatabase()
         defer { try? FileManager.default.removeItem(at: location.directory) }
         _ = try DiskBroker(path: location.path)
@@ -98,9 +98,7 @@ struct SchemaVersionTests {
             try execute(db, """
                 CREATE TABLE volume_metadata
                 (root TEXT PRIMARY KEY, entry_count INTEGER NOT NULL
-                CHECK (entry_count > 0), quarantined INTEGER NOT NULL DEFAULT 0
-                CHECK (typeof(quarantined) = 'integer' AND quarantined IN (0, 1)),
-                stored_at TEXT NOT NULL DEFAULT (datetime('now')))
+                CHECK (typeof(entry_count) = 'integer'   AND entry_count > 0))
                 """)
         }
 
@@ -197,7 +195,7 @@ struct SchemaVersionTests {
         #expect(brokers.count == 16)
         try withDatabase(at: location.path) { db in
             let version = try scalar(db, "PRAGMA user_version")
-            #expect(version == 1)
+            #expect(version == 2)
         }
     }
 
@@ -228,7 +226,7 @@ struct SchemaVersionTests {
             _ = try DiskBroker(path: location.path)
             Issue.record("nonempty v0 database must require migration")
         } catch {
-            #expect(error as? BrokerError == .migrationRequired(found: 0, required: 1))
+            #expect(error as? BrokerError == .migrationRequired(found: 0, required: 2))
         }
 
         try withDatabase(at: location.path) { db in
@@ -247,7 +245,53 @@ struct SchemaVersionTests {
         }
     }
 
+    /// v1 carried owner/count pins and pin expiry. It is not migrated: the
+    /// store is rebuilt from a clean path.
+    @Test func v1StoreIsRejectedWithoutMutation() throws {
+        let location = try temporaryDatabase()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        try withDatabase(at: location.path) { db in
+            try execute(db, "CREATE TABLE volume_pins (root TEXT NOT NULL, owner TEXT NOT NULL)")
+            try execute(db, "INSERT INTO volume_pins VALUES('root', 'owner')")
+            try execute(db, "PRAGMA user_version=1")
+        }
+
+        do {
+            _ = try DiskBroker(path: location.path)
+            Issue.record("v1 schema must fail closed")
+        } catch {
+            #expect(error as? BrokerError == .migrationRequired(found: 1, required: 2))
+        }
+        try withDatabase(at: location.path) { db in
+            let version = try scalar(db, "PRAGMA user_version")
+            let pinRows = try scalar(db, "SELECT COUNT(*) FROM volume_pins")
+            #expect(version == 1)
+            #expect(pinRows == 1)
+        }
+    }
+
     @Test func futureVersionIsRejectedWithoutMutation() throws {
+        let location = try temporaryDatabase()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        try withDatabase(at: location.path) { db in
+            try execute(db, "PRAGMA user_version=3")
+        }
+
+        do {
+            _ = try DiskBroker(path: location.path)
+            Issue.record("future schema must fail closed")
+        } catch {
+            #expect(error as? BrokerError == .migrationRequired(found: 3, required: 2))
+        }
+        try withDatabase(at: location.path) { db in
+            let version = try scalar(db, "PRAGMA user_version")
+            let brokerTables = try scalar(db, "SELECT COUNT(*) FROM sqlite_schema WHERE name='cas_data'")
+            #expect(version == 3)
+            #expect(brokerTables == 0)
+        }
+    }
+
+    @Test func stampedV2WithoutV2SchemaIsRejected() throws {
         let location = try temporaryDatabase()
         defer { try? FileManager.default.removeItem(at: location.directory) }
         try withDatabase(at: location.path) { db in
@@ -256,34 +300,13 @@ struct SchemaVersionTests {
 
         do {
             _ = try DiskBroker(path: location.path)
-            Issue.record("future schema must fail closed")
-        } catch {
-            #expect(error as? BrokerError == .migrationRequired(found: 2, required: 1))
-        }
-        try withDatabase(at: location.path) { db in
-            let version = try scalar(db, "PRAGMA user_version")
-            let brokerTables = try scalar(db, "SELECT COUNT(*) FROM sqlite_schema WHERE name='cas_data'")
-            #expect(version == 2)
-            #expect(brokerTables == 0)
-        }
-    }
-
-    @Test func stampedV1WithoutV1SchemaIsRejected() throws {
-        let location = try temporaryDatabase()
-        defer { try? FileManager.default.removeItem(at: location.directory) }
-        try withDatabase(at: location.path) { db in
-            try execute(db, "PRAGMA user_version=1")
-        }
-
-        do {
-            _ = try DiskBroker(path: location.path)
             Issue.record("schema stamp without schema must fail closed")
         } catch {
-            #expect(error as? BrokerError == .invalidSchema(version: 1))
+            #expect(error as? BrokerError == .invalidSchema(version: 2))
         }
     }
 
-    @Test func behaviorChangingV1SchemaIsRejected() throws {
+    @Test func behaviorChangingV2SchemaIsRejected() throws {
         let location = try temporaryDatabase()
         defer { try? FileManager.default.removeItem(at: location.directory) }
         do { _ = try DiskBroker(path: location.path) }
@@ -292,19 +315,16 @@ struct SchemaVersionTests {
             try execute(db, """
                 CREATE TABLE volume_metadata (
                     root TEXT PRIMARY KEY,
-                    entry_count INTEGER NOT NULL CHECK (entry_count > 0),
-                    quarantined INTEGER NOT NULL DEFAULT 0
-                        CHECK (typeof(quarantined) = 'integer' AND quarantined IN (0, 1)),
-                    stored_at TEXT NOT NULL DEFAULT (datetime('n ow'))
+                    entry_count INTEGER NOT NULL CHECK (entry_count > 0)
                 )
                 """)
         }
 
         do {
             _ = try DiskBroker(path: location.path)
-            Issue.record("behavior-changing v1 schema must fail closed")
+            Issue.record("behavior-changing v2 schema must fail closed")
         } catch {
-            #expect(error as? BrokerError == .invalidSchema(version: 1))
+            #expect(error as? BrokerError == .invalidSchema(version: 2))
         }
     }
 
@@ -320,7 +340,7 @@ struct SchemaVersionTests {
             _ = try DiskBroker(path: location.path)
             Issue.record("missing canonical index must fail closed")
         } catch {
-            #expect(error as? BrokerError == .invalidSchema(version: 1))
+            #expect(error as? BrokerError == .invalidSchema(version: 2))
         }
     }
 
@@ -329,18 +349,18 @@ struct SchemaVersionTests {
         defer { try? FileManager.default.removeItem(at: location.directory) }
         do { _ = try DiskBroker(path: location.path) }
         try withDatabase(at: location.path) { db in
-            try execute(db, "CREATE UNIQUE INDEX bad_owner ON volume_pins(owner)")
+            try execute(db, "CREATE UNIQUE INDEX bad_owner ON retained_roots(root)")
         }
 
         do {
             _ = try DiskBroker(path: location.path)
             Issue.record("behavior-changing index must fail closed")
         } catch {
-            #expect(error as? BrokerError == .invalidSchema(version: 1))
+            #expect(error as? BrokerError == .invalidSchema(version: 2))
         }
     }
 
-    @Test func reopeningV1PreservesExistingTables() throws {
+    @Test func reopeningV2PreservesExistingTables() throws {
         let location = try temporaryDatabase()
         defer { try? FileManager.default.removeItem(at: location.directory) }
         _ = try DiskBroker(path: location.path)
@@ -373,7 +393,7 @@ struct SchemaVersionTests {
             _ = try DiskBroker(path: location.path)
             Issue.record("incoming foreign keys must not attach behavior to owned tables")
         } catch {
-            #expect(error as? BrokerError == .invalidSchema(version: 1))
+            #expect(error as? BrokerError == .invalidSchema(version: 2))
         }
     }
 }
